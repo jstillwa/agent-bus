@@ -124,20 +124,68 @@ jobs:
       contents: read
       id-token: write
     steps:
-      - uses: actions/checkout@v5
-
-      - name: Download artifacts
+      - name: Download sdist
         uses: actions/download-artifact@v7
         with:
+          name: sdist
           path: dist
-          merge-multiple: true
 
-      - name: Remove non-distribution artifacts
+      - name: Download Linux wheels
+        uses: actions/download-artifact@v7
+        with:
+          name: wheels-Linux
+          path: dist
+
+      - name: Download macOS wheels
+        uses: actions/download-artifact@v7
+        with:
+          name: wheels-macOS
+          path: dist
+
+      - name: Download Windows wheels
+        uses: actions/download-artifact@v7
+        with:
+          name: wheels-Windows
+          path: dist
+
+      - name: Verify downloaded distributions
         shell: bash
+        env:
+          PACKAGE_VERSION: ${{ needs.version-plan.outputs.package_version }}
         run: |
           set -euo pipefail
-          rm -f dist/README.pypi.md || true
-          rm -rf dist/.pypi-assets || true
+          shopt -s nullglob
+          files=(dist/*)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "::error::No distributions were downloaded."
+            exit 1
+          fi
+
+          for file in "${files[@]}"; do
+            name="$(basename "$file")"
+            case "$name" in
+              "agent_bus_mcp-${PACKAGE_VERSION}.tar.gz"|agent_bus_mcp-"${PACKAGE_VERSION}"-*.whl)
+                ;;
+              *)
+                echo "::error::Unexpected distribution artifact: $name"
+                exit 1
+                ;;
+            esac
+          done
+
+          sdist_count="$(find dist -maxdepth 1 -type f -name "agent_bus_mcp-${PACKAGE_VERSION}.tar.gz" -print | wc -l | tr -d ' ')"
+          wheel_count="$(find dist -maxdepth 1 -type f -name "agent_bus_mcp-${PACKAGE_VERSION}-*.whl" -print | wc -l | tr -d ' ')"
+          if [ "$sdist_count" -ne 1 ]; then
+            echo "::error::Expected exactly one sdist for ${PACKAGE_VERSION}, found $sdist_count."
+            exit 1
+          fi
+          if [ "$wheel_count" -ne 4 ]; then
+            echo "::error::Expected exactly four wheels for ${PACKAGE_VERSION}, found $wheel_count."
+            exit 1
+          fi
+
+          printf 'Verified release distributions:\n'
+          printf '  %s\n' "${files[@]}"
 
       - uses: astral-sh/setup-uv@v7
         with:
@@ -155,19 +203,30 @@ jobs:
 
       - name: Upload distributions with trusted publishing
         shell: bash
+        env:
+          PACKAGE_VERSION: ${{ needs.version-plan.outputs.package_version }}
         run: |
           set -euo pipefail
+          shopt -s nullglob
           publish_url="https://test.pypi.org/legacy/"
           check_url="https://test.pypi.org/simple/"
           if [ "${{ inputs.publish_target }}" = "pypi" ]; then
             publish_url="https://upload.pypi.org/legacy/"
             check_url="https://pypi.org/simple/"
           fi
+          distributions=(
+            "dist/agent_bus_mcp-${PACKAGE_VERSION}.tar.gz"
+            dist/agent_bus_mcp-"${PACKAGE_VERSION}"-*.whl
+          )
+          if [ ${#distributions[@]} -ne 5 ]; then
+            echo "::error::Expected five verified distributions, found ${#distributions[@]}."
+            exit 1
+          fi
           uv publish \
             --publish-url "$publish_url" \
             --check-url "$check_url" \
             --trusted-publishing always \
-            dist/*
+            "${distributions[@]}"
 
   qa-install:
     needs:
