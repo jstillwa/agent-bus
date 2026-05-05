@@ -86,6 +86,8 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    outputs:
+      artefacts_dir: ${{ steps.asset-inputs.outputs.artefacts_dir }}
     steps:
       - uses: actions/checkout@v5
         if: inputs.enabled
@@ -97,6 +99,35 @@ jobs:
         if: inputs.enabled
         with:
           node-version: ${{ inputs.node_version }}
+
+      - name: Validate README asset path input
+        if: inputs.enabled
+        id: asset-inputs
+        env:
+          ARTEFACTS_DIR: ${{ inputs.artefacts_dir }}
+        run: |
+          python3 - <<'PY'
+          from __future__ import annotations
+
+          import os
+
+          value = os.environ["ARTEFACTS_DIR"]
+          parts = value.split("/")
+          if (
+              not value
+              or value.startswith("/")
+              or "\\" in value
+              or ":" in value
+              or any(part in ("", ".", "..") for part in parts)
+          ):
+              raise SystemExit(
+                  "artefacts_dir must be a relative path without empty, '.', '..', "
+                  "backslash, or drive components"
+              )
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              fh.write(f"artefacts_dir={'/'.join(parts)}\n")
+          PY
 
       - name: Detect Mermaid blocks
         if: inputs.enabled
@@ -116,7 +147,7 @@ jobs:
         env:
           README_PATH: ${{ inputs.readme_path }}
           OUT_PATH: ${{ inputs.output_readme_path }}
-          ARTEFACTS_DIR: ${{ inputs.artefacts_dir }}
+          ARTEFACTS_DIR: ${{ steps.asset-inputs.outputs.artefacts_dir }}
         run: |
           set -euo pipefail
           if [ -L "$ARTEFACTS_DIR" ]; then
@@ -131,7 +162,7 @@ jobs:
         env:
           README_PATH: ${{ inputs.readme_path }}
           OUT_PATH: ${{ inputs.output_readme_path }}
-          ARTEFACTS_DIR: ${{ inputs.artefacts_dir }}
+          ARTEFACTS_DIR: ${{ steps.asset-inputs.outputs.artefacts_dir }}
           OUTPUT_FORMAT: ${{ inputs.output_format }}
           BACKGROUND_COLOR: ${{ inputs.background_color }}
           MMDC_PACKAGE: ${{ inputs.mmdc_package }}
@@ -156,7 +187,7 @@ jobs:
         if: inputs.enabled
         env:
           OUT_PATH: ${{ inputs.output_readme_path }}
-          ARTEFACTS_DIR: ${{ inputs.artefacts_dir }}
+          ARTEFACTS_DIR: ${{ steps.asset-inputs.outputs.artefacts_dir }}
         run: |
           python3 - <<'PY'
           from __future__ import annotations
@@ -252,7 +283,7 @@ jobs:
         if: inputs.enabled && inputs.upload_release_assets && inputs.assets_mode == 'release'
         env:
           OUT_PATH: ${{ inputs.output_readme_path }}
-          ARTEFACTS_DIR: ${{ inputs.artefacts_dir }}
+          ARTEFACTS_DIR: ${{ steps.asset-inputs.outputs.artefacts_dir }}
           RELEASE_TAG: ${{ inputs.release_tag }}
           REPO: ${{ github.repository }}
         run: |
@@ -286,7 +317,7 @@ jobs:
         if: inputs.enabled && inputs.upload_release_assets && inputs.assets_mode == 'branch'
         env:
           OUT_PATH: ${{ inputs.output_readme_path }}
-          ARTEFACTS_DIR: ${{ inputs.artefacts_dir }}
+          ARTEFACTS_DIR: ${{ steps.asset-inputs.outputs.artefacts_dir }}
           ASSETS_REF: ${{ inputs.release_tag }}
           REPO: ${{ github.repository }}
         run: |
@@ -325,7 +356,7 @@ jobs:
       - name: Validate staged README assets
         if: inputs.enabled
         env:
-          ARTEFACTS_DIR: ${{ inputs.artefacts_dir }}
+          ARTEFACTS_DIR: ${{ steps.asset-inputs.outputs.artefacts_dir }}
         run: |
           python3 - <<'PY'
           from __future__ import annotations
@@ -333,7 +364,14 @@ jobs:
           import os
           from pathlib import Path
 
-          artefacts_dir = Path(os.environ["ARTEFACTS_DIR"])
+          repo_root = Path.cwd().resolve()
+          artefacts_dir = (repo_root / os.environ["ARTEFACTS_DIR"]).resolve()
+          try:
+              artefacts_dir.relative_to(repo_root)
+          except ValueError as exc:
+              raise SystemExit(
+                  f"README assets directory escapes repository root: {artefacts_dir}"
+              ) from exc
           allowed_extensions = {
               ".avif",
               ".bmp",
@@ -356,7 +394,7 @@ jobs:
               if path.is_symlink():
                   raise SystemExit(f"README asset must not be a symlink: {path}")
               if path.is_dir():
-                  continue
+                  raise SystemExit(f"README assets directory must be flat: {path}")
               if not path.is_file():
                   raise SystemExit(f"README asset is not a regular file: {path}")
               if path.suffix.lower() not in allowed_extensions:
@@ -370,7 +408,7 @@ jobs:
           name: ${{ inputs.artifact_name }}
           path: |
             ${{ inputs.output_readme_path }}
-            ${{ inputs.artefacts_dir }}/**
+            ${{ steps.asset-inputs.outputs.artefacts_dir }}/**
           if-no-files-found: error
 
   publish-assets:
@@ -388,7 +426,7 @@ jobs:
 
       - name: Validate downloaded README assets
         env:
-          ARTEFACTS_DIR: ${{ inputs.artefacts_dir }}
+          ARTEFACTS_DIR: ${{ needs.render.outputs.artefacts_dir }}
         run: |
           python3 - <<'PY'
           from __future__ import annotations
@@ -396,8 +434,14 @@ jobs:
           import os
           from pathlib import Path
 
-          root = Path("pypi-readme-artifact")
-          artefacts_dir = root / os.environ["ARTEFACTS_DIR"]
+          root = Path("pypi-readme-artifact").resolve()
+          artefacts_dir = (root / os.environ["ARTEFACTS_DIR"]).resolve()
+          try:
+              artefacts_dir.relative_to(root)
+          except ValueError as exc:
+              raise SystemExit(
+                  f"README assets directory escapes downloaded artifact root: {artefacts_dir}"
+              ) from exc
           allowed_extensions = {
               ".avif",
               ".bmp",
@@ -420,7 +464,7 @@ jobs:
               if path.is_symlink():
                   raise SystemExit(f"README asset must not be a symlink: {path}")
               if path.is_dir():
-                  continue
+                  raise SystemExit(f"README assets directory must be flat: {path}")
               if not path.is_file():
                   raise SystemExit(f"README asset is not a regular file: {path}")
               if path.suffix.lower() not in allowed_extensions:
@@ -432,7 +476,7 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          ARTEFACTS_DIR: ${{ inputs.artefacts_dir }}
+          ARTEFACTS_DIR: ${{ needs.render.outputs.artefacts_dir }}
           RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
           set -euo pipefail
@@ -463,7 +507,7 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          ARTEFACTS_DIR: ${{ inputs.artefacts_dir }}
+          ARTEFACTS_DIR: ${{ needs.render.outputs.artefacts_dir }}
           ASSETS_REF: ${{ inputs.release_tag }}
           REPO: ${{ github.repository }}
         run: |
