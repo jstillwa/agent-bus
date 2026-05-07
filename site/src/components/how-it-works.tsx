@@ -40,30 +40,32 @@ export function HowItWorks() {
           </p>
         </div>
 
-        <div className="grid gap-10 lg:grid-cols-[0.9fr_1.1fr] lg:items-start">
-          <ol className="space-y-4">
+        <div className="grid min-w-0 gap-10 lg:grid-cols-[0.9fr_1.1fr] lg:items-start">
+          <ol className="min-w-0 space-y-4">
             {STEPS.map((step) => (
               <li
                 key={step.number}
-                className="group rounded-2xl border border-fd-border bg-fd-card p-5 transition hover:border-[color:var(--color-accent-amber-soft)] hover:shadow-sm"
+                className="group min-w-0 rounded-2xl border border-fd-border bg-fd-card p-5 transition hover:border-[color:var(--color-accent-amber-soft)] hover:shadow-sm"
               >
-                <div className="flex items-baseline gap-3">
+                <div className="flex min-w-0 items-baseline gap-3">
                   <span className="font-mono text-xs font-medium tracking-[0.18em] text-[color:var(--color-accent-amber)]">
                     {step.number}
                   </span>
-                  <h3 className="text-lg font-semibold text-fd-foreground">{step.title}</h3>
+                  <h3 className="min-w-0 text-lg font-semibold text-fd-foreground">
+                    {step.title}
+                  </h3>
                 </div>
                 <p className="mt-2 text-sm leading-6 text-fd-muted-foreground">
                   {step.description}
                 </p>
-                <pre className="mt-3 overflow-x-auto rounded-md border border-fd-border bg-fd-muted/60 px-3 py-2 font-mono text-[12.5px] leading-5 text-fd-foreground/85">
+                <pre className="mt-3 max-w-full overflow-x-auto rounded-md border border-fd-border bg-fd-muted/60 px-3 py-2 font-mono text-[12.5px] leading-5 text-fd-foreground/85">
                   <code>{step.code}</code>
                 </pre>
               </li>
             ))}
           </ol>
 
-          <div className="lg:sticky lg:top-24">
+          <div className="min-w-0 lg:sticky lg:top-24">
             <TopicFlowDiagram />
           </div>
         </div>
