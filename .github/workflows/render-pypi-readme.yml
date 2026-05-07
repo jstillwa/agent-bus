@@ -162,11 +162,12 @@ jobs:
               or "//" in value
               or "@{" in value
               or "\\" in value
+              or parts[0] in ("refs", "heads", "tags")
               or any(part in ("", ".", "..") or part.endswith(".lock") for part in parts)
           ):
               raise SystemExit(
                   "release_tag must be a safe tag/branch ref containing only letters, "
-                  "digits, '.', '_', '-', and '/'"
+                  "digits, '.', '_', '-', and '/', without reserved ref prefixes"
               )
 
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
