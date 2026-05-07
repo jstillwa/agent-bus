@@ -164,6 +164,10 @@ jobs:
           fi
 
           for file in "${files[@]}"; do
+            if [ -L "$file" ]; then
+              echo "::error::Unexpected symlink distribution artifact: $file"
+              exit 1
+            fi
             if [ ! -f "$file" ]; then
               echo "::error::Unexpected non-file distribution artifact: $file"
               exit 1
