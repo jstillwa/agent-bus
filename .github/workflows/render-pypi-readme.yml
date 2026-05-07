@@ -121,11 +121,11 @@ jobs:
               or value.startswith("/")
               or "\\" in value
               or ":" in value
-              or any(part in ("", ".", "..") for part in parts)
+              or any(part in ("", ".", "..") or part.startswith("-") for part in parts)
           ):
               raise SystemExit(
                   "artefacts_dir must be a relative path without empty, '.', '..', "
-                  "backslash, or drive components"
+                  "dash-prefixed, backslash, or drive components"
               )
 
           current = Path.cwd()
@@ -171,6 +171,68 @@ jobs:
 
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
               fh.write(f"release_tag={value}\n")
+          PY
+
+      - name: Validate README file path inputs
+        if: inputs.enabled
+        env:
+          README_PATH: ${{ inputs.readme_path }}
+          OUT_PATH: ${{ inputs.output_readme_path }}
+        run: |
+          python3 - <<'PY'
+          from __future__ import annotations
+
+          import os
+          from pathlib import Path
+
+          repo_root = Path.cwd().resolve()
+          blocked_parts = {".git", ".github", ".hg", ".svn"}
+
+          def safe_relative_path(name: str, value: str) -> Path:
+              parts = value.split("/")
+              if (
+                  not value
+                  or any(ord(ch) < 32 or ord(ch) == 127 for ch in value)
+                  or value.startswith("/")
+                  or "\\" in value
+                  or ":" in value
+                  or any(part in ("", ".", "..") or part.startswith("-") for part in parts)
+                  or blocked_parts & set(parts)
+              ):
+                  raise SystemExit(
+                      f"{name} must be a safe relative path without control characters, "
+                      "empty, '.', '..', dash-prefixed, VCS/control, backslash, or drive "
+                      "components"
+                  )
+              return Path(*parts)
+
+          def reject_symlink_components(name: str, relative_path: Path) -> None:
+              current = repo_root
+              for part in relative_path.parts:
+                  current = current / part
+                  if current.is_symlink():
+                      raise SystemExit(f"{name} path component must not be a symlink: {current}")
+
+          readme_path = safe_relative_path("readme_path", os.environ["README_PATH"])
+          output_path = safe_relative_path("output_readme_path", os.environ["OUT_PATH"])
+
+          reject_symlink_components("readme_path", readme_path)
+          source = (repo_root / readme_path).resolve()
+          try:
+              source.relative_to(repo_root)
+          except ValueError as exc:
+              raise SystemExit(f"readme_path escapes repository root: {source}") from exc
+          if not source.is_file():
+              raise SystemExit(f"readme_path must be an existing regular file: {source}")
+
+          reject_symlink_components("output_readme_path", output_path)
+          target = (repo_root / output_path).resolve()
+          try:
+              target.relative_to(repo_root)
+          except ValueError as exc:
+              raise SystemExit(f"output_readme_path escapes repository root: {target}") from exc
+          if target.exists() and not target.is_file():
+              raise SystemExit(f"output_readme_path must not point to a directory: {target}")
           PY
 
       - name: Detect Mermaid blocks
@@ -242,9 +304,9 @@ jobs:
           from pathlib import Path
           from urllib.parse import urlsplit
 
-          out_path = Path(os.environ["OUT_PATH"])
-          artefacts_dir = Path(os.environ["ARTEFACTS_DIR"])
           repo_root = Path.cwd().resolve()
+          out_path = Path(os.environ["OUT_PATH"])
+          artefacts_ref = Path(os.environ["ARTEFACTS_DIR"])
           allowed_extensions = {
               ".avif",
               ".bmp",
@@ -258,6 +320,24 @@ jobs:
           }
           blocked_parts = {".git", ".github", ".hg", ".svn"}
 
+          def resolve_artefacts_dir() -> Path:
+              current = repo_root
+              for part in artefacts_ref.parts:
+                  current = current / part
+                  if current.is_symlink():
+                      raise SystemExit(
+                          f"README assets directory component must not be a symlink: {current}"
+                      )
+              resolved = (repo_root / artefacts_ref).resolve()
+              try:
+                  resolved.relative_to(repo_root)
+              except ValueError as exc:
+                  raise SystemExit(
+                      f"README assets directory escapes repository root: {resolved}"
+                  ) from exc
+              return resolved
+
+          artefacts_dir = resolve_artefacts_dir()
           text = out_path.read_text(encoding="utf-8")
           artefacts_dir.mkdir(parents=True, exist_ok=True)
 
@@ -284,7 +364,7 @@ jobs:
                   return ref
 
               normalized = path[2:] if path.startswith("./") else path
-              artefacts_prefix = f"{artefacts_dir.as_posix().rstrip('/')}/"
+              artefacts_prefix = f"{artefacts_ref.as_posix().rstrip('/')}/"
               if normalized.startswith(artefacts_prefix):
                   rewritten[ref] = ref
                   return ref
@@ -309,10 +389,10 @@ jobs:
                   raise SystemExit(f"README image path has unsupported extension: {ref}")
 
               dest_name = "__".join(source_rel.parts)
-              dest = artefacts_dir / dest_name
+              dest = resolve_artefacts_dir() / dest_name
               shutil.copy2(source, dest)
 
-              staged = f"{artefacts_dir.as_posix().rstrip('/')}/{dest_name}"
+              staged = f"{artefacts_ref.as_posix().rstrip('/')}/{dest_name}"
               if parsed.query:
                   staged = f"{staged}?{parsed.query}"
               if parsed.fragment:
