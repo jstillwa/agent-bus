@@ -121,11 +121,12 @@ jobs:
               or value.startswith("/")
               or "\\" in value
               or ":" in value
+              or any(ch in value for ch in "*?[]")
               or any(part in ("", ".", "..") or part.startswith("-") for part in parts)
           ):
               raise SystemExit(
                   "artefacts_dir must be a relative path without empty, '.', '..', "
-                  "dash-prefixed, backslash, or drive components"
+                  "dash-prefixed, glob, backslash, or drive components"
               )
 
           current = Path.cwd()
@@ -197,13 +198,14 @@ jobs:
                   or value.startswith("/")
                   or "\\" in value
                   or ":" in value
+                  or any(ch in value for ch in "*?[]")
                   or any(part in ("", ".", "..") or part.startswith("-") for part in parts)
                   or blocked_parts & set(parts)
               ):
                   raise SystemExit(
                       f"{name} must be a safe relative path without control characters, "
-                      "empty, '.', '..', dash-prefixed, VCS/control, backslash, or drive "
-                      "components"
+                      "empty, '.', '..', dash-prefixed, glob, VCS/control, backslash, or "
+                      "drive components"
                   )
               return Path(*parts)
 
