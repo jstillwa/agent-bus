@@ -111,11 +111,13 @@ jobs:
           from __future__ import annotations
 
           import os
+          from pathlib import Path
 
           value = os.environ["ARTEFACTS_DIR"]
           parts = value.split("/")
           if (
               not value
+              or any(ord(ch) < 32 or ord(ch) == 127 for ch in value)
               or value.startswith("/")
               or "\\" in value
               or ":" in value
@@ -125,6 +127,14 @@ jobs:
                   "artefacts_dir must be a relative path without empty, '.', '..', "
                   "backslash, or drive components"
               )
+
+          current = Path.cwd()
+          for part in parts:
+              current = current / part
+              if current.is_symlink():
+                  raise SystemExit(
+                      f"artefacts_dir path component must not be a symlink: {current}"
+                  )
 
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
               fh.write(f"artefacts_dir={'/'.join(parts)}\n")
