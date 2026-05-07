@@ -666,7 +666,7 @@ jobs:
               --prerelease
           fi
 
-          gh release upload "$tag" "${files[@]}" --clobber
+          gh release upload "$tag" --clobber -- "${files[@]}"
 
       - name: Upload README assets to GitHub assets branch
         if: inputs.assets_mode == 'branch'

@@ -154,14 +154,20 @@ jobs:
           PACKAGE_VERSION: ${{ needs.version-plan.outputs.package_version }}
         run: |
           set -euo pipefail
-          shopt -s nullglob
-          files=(dist/*)
+          files=()
+          while IFS= read -r -d '' file; do
+            files+=("$file")
+          done < <(find dist -mindepth 1 -maxdepth 1 -print0)
           if [ ${#files[@]} -eq 0 ]; then
             echo "::error::No distributions were downloaded."
             exit 1
           fi
 
           for file in "${files[@]}"; do
+            if [ ! -f "$file" ]; then
+              echo "::error::Unexpected non-file distribution artifact: $file"
+              exit 1
+            fi
             name="$(basename "$file")"
             case "$name" in
               "agent_bus_mcp-${PACKAGE_VERSION}.tar.gz"|agent_bus_mcp-"${PACKAGE_VERSION}"-*.whl)
