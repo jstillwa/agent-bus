@@ -416,7 +416,15 @@ jobs:
           from pathlib import Path
 
           repo_root = Path.cwd().resolve()
-          artefacts_dir = (repo_root / os.environ["ARTEFACTS_DIR"]).resolve()
+          artefacts_ref = Path(os.environ["ARTEFACTS_DIR"])
+          current = repo_root
+          for part in artefacts_ref.parts:
+              current = current / part
+              if current.is_symlink():
+                  raise SystemExit(
+                      f"README assets directory component must not be a symlink: {current}"
+                  )
+          artefacts_dir = (repo_root / artefacts_ref).resolve()
           try:
               artefacts_dir.relative_to(repo_root)
           except ValueError as exc:
@@ -494,7 +502,15 @@ jobs:
           from pathlib import Path
 
           root = Path("pypi-readme-artifact").resolve()
-          artefacts_dir = (root / os.environ["ARTEFACTS_DIR"]).resolve()
+          artefacts_ref = Path(os.environ["ARTEFACTS_DIR"])
+          current = root
+          for part in artefacts_ref.parts:
+              current = current / part
+              if current.is_symlink():
+                  raise SystemExit(
+                      f"README assets directory component must not be a symlink: {current}"
+                  )
+          artefacts_dir = (root / artefacts_ref).resolve()
           try:
               artefacts_dir.relative_to(root)
           except ValueError as exc:
