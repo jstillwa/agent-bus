@@ -85,17 +85,158 @@ jobs:
   render:
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: read
+    outputs:
+      artefacts_dir: ${{ steps.asset-inputs.outputs.artefacts_dir }}
+      release_tag: ${{ steps.asset-ref.outputs.release_tag }}
     steps:
       - uses: actions/checkout@v5
         if: inputs.enabled
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - uses: actions/setup-node@v6
         if: inputs.enabled
         with:
           node-version: ${{ inputs.node_version }}
+
+      - name: Validate README asset path input
+        if: inputs.enabled
+        id: asset-inputs
+        env:
+          ARTEFACTS_DIR: ${{ inputs.artefacts_dir }}
+        run: |
+          python3 - <<'PY'
+          from __future__ import annotations
+
+          import os
+          from pathlib import Path
+
+          value = os.environ["ARTEFACTS_DIR"]
+          parts = value.split("/")
+          if (
+              not value
+              or any(ord(ch) < 32 or ord(ch) == 127 for ch in value)
+              or value.startswith("/")
+              or "\\" in value
+              or ":" in value
+              or any(ch in value for ch in "*?[]")
+              or any(part in ("", ".", "..") or part.startswith("-") for part in parts)
+          ):
+              raise SystemExit(
+                  "artefacts_dir must be a relative path without empty, '.', '..', "
+                  "dash-prefixed, glob, backslash, or drive components"
+              )
+
+          current = Path.cwd()
+          for part in parts:
+              current = current / part
+              if current.is_symlink():
+                  raise SystemExit(
+                      f"artefacts_dir path component must not be a symlink: {current}"
+                  )
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              fh.write(f"artefacts_dir={'/'.join(parts)}\n")
+          PY
+
+      - name: Validate release asset ref input
+        if: inputs.enabled && inputs.upload_release_assets
+        id: asset-ref
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          python3 - <<'PY'
+          from __future__ import annotations
+
+          import os
+          import re
+
+          value = os.environ["RELEASE_TAG"]
+          parts = value.split("/")
+          if (
+              not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,127}", value)
+              or value.startswith(("-", "/"))
+              or value.endswith(("/", "."))
+              or ".." in value
+              or "//" in value
+              or "@{" in value
+              or "\\" in value
+              or parts[0] in ("refs", "heads", "tags")
+              or any(part in ("", ".", "..") or part.endswith(".lock") for part in parts)
+          ):
+              raise SystemExit(
+                  "release_tag must be a safe tag/branch ref containing only letters, "
+                  "digits, '.', '_', '-', and '/', without reserved ref prefixes"
+              )
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              fh.write(f"release_tag={value}\n")
+          PY
+
+      - name: Validate README file path inputs
+        if: inputs.enabled
+        env:
+          README_PATH: ${{ inputs.readme_path }}
+          OUT_PATH: ${{ inputs.output_readme_path }}
+        run: |
+          python3 - <<'PY'
+          from __future__ import annotations
+
+          import os
+          from pathlib import Path
+
+          repo_root = Path.cwd().resolve()
+          blocked_parts = {".git", ".github", ".hg", ".svn"}
+
+          def safe_relative_path(name: str, value: str) -> Path:
+              parts = value.split("/")
+              if (
+                  not value
+                  or any(ord(ch) < 32 or ord(ch) == 127 for ch in value)
+                  or value.startswith("/")
+                  or "\\" in value
+                  or ":" in value
+                  or any(ch in value for ch in "*?[]")
+                  or any(part in ("", ".", "..") or part.startswith("-") for part in parts)
+                  or blocked_parts & set(parts)
+              ):
+                  raise SystemExit(
+                      f"{name} must be a safe relative path without control characters, "
+                      "empty, '.', '..', dash-prefixed, glob, VCS/control, backslash, or "
+                      "drive components"
+                  )
+              return Path(*parts)
+
+          def reject_symlink_components(name: str, relative_path: Path) -> None:
+              current = repo_root
+              for part in relative_path.parts:
+                  current = current / part
+                  if current.is_symlink():
+                      raise SystemExit(f"{name} path component must not be a symlink: {current}")
+
+          readme_path = safe_relative_path("readme_path", os.environ["README_PATH"])
+          output_path = safe_relative_path("output_readme_path", os.environ["OUT_PATH"])
+
+          reject_symlink_components("readme_path", readme_path)
+          source = (repo_root / readme_path).resolve()
+          try:
+              source.relative_to(repo_root)
+          except ValueError as exc:
+              raise SystemExit(f"readme_path escapes repository root: {source}") from exc
+          if not source.is_file():
+              raise SystemExit(f"readme_path must be an existing regular file: {source}")
+
+          reject_symlink_components("output_readme_path", output_path)
+          target = (repo_root / output_path).resolve()
+          try:
+              target.relative_to(repo_root)
+          except ValueError as exc:
+              raise SystemExit(f"output_readme_path escapes repository root: {target}") from exc
+          if target.exists() and not target.is_file():
+              raise SystemExit(f"output_readme_path must not point to a directory: {target}")
+          PY
 
       - name: Detect Mermaid blocks
         if: inputs.enabled
@@ -115,9 +256,13 @@ jobs:
         env:
           README_PATH: ${{ inputs.readme_path }}
           OUT_PATH: ${{ inputs.output_readme_path }}
-          ARTEFACTS_DIR: ${{ inputs.artefacts_dir }}
+          ARTEFACTS_DIR: ${{ steps.asset-inputs.outputs.artefacts_dir }}
         run: |
           set -euo pipefail
+          if [ -L "$ARTEFACTS_DIR" ]; then
+            echo "::error::README assets directory must not be a symlink: $ARTEFACTS_DIR"
+            exit 1
+          fi
           cp "$README_PATH" "$OUT_PATH"
           mkdir -p "$ARTEFACTS_DIR"
 
@@ -126,12 +271,16 @@ jobs:
         env:
           README_PATH: ${{ inputs.readme_path }}
           OUT_PATH: ${{ inputs.output_readme_path }}
-          ARTEFACTS_DIR: ${{ inputs.artefacts_dir }}
+          ARTEFACTS_DIR: ${{ steps.asset-inputs.outputs.artefacts_dir }}
           OUTPUT_FORMAT: ${{ inputs.output_format }}
           BACKGROUND_COLOR: ${{ inputs.background_color }}
           MMDC_PACKAGE: ${{ inputs.mmdc_package }}
         run: |
           set -euo pipefail
+          if [ -L "$ARTEFACTS_DIR" ]; then
+            echo "::error::README assets directory must not be a symlink: $ARTEFACTS_DIR"
+            exit 1
+          fi
           mkdir -p "$ARTEFACTS_DIR"
           puppeteer_cfg="$RUNNER_TEMP/puppeteer.json"
           echo '{"args":["--no-sandbox"]}' >"$puppeteer_cfg"
@@ -147,9 +296,9 @@ jobs:
         if: inputs.enabled
         env:
           OUT_PATH: ${{ inputs.output_readme_path }}
-          ARTEFACTS_DIR: ${{ inputs.artefacts_dir }}
+          ARTEFACTS_DIR: ${{ steps.asset-inputs.outputs.artefacts_dir }}
         run: |
-          python - <<'PY'
+          python3 - <<'PY'
           from __future__ import annotations
 
           import os
@@ -158,10 +307,40 @@ jobs:
           from pathlib import Path
           from urllib.parse import urlsplit
 
-          out_path = Path(os.environ["OUT_PATH"])
-          artefacts_dir = Path(os.environ["ARTEFACTS_DIR"])
           repo_root = Path.cwd().resolve()
+          out_path = Path(os.environ["OUT_PATH"])
+          artefacts_ref = Path(os.environ["ARTEFACTS_DIR"])
+          allowed_extensions = {
+              ".avif",
+              ".bmp",
+              ".gif",
+              ".ico",
+              ".jpeg",
+              ".jpg",
+              ".png",
+              ".svg",
+              ".webp",
+          }
+          blocked_parts = {".git", ".github", ".hg", ".svn"}
 
+          def resolve_artefacts_dir() -> Path:
+              current = repo_root
+              for part in artefacts_ref.parts:
+                  current = current / part
+                  if current.is_symlink():
+                      raise SystemExit(
+                          f"README assets directory component must not be a symlink: {current}"
+                      )
+              resolved = (repo_root / artefacts_ref).resolve()
+              try:
+                  resolved.relative_to(repo_root)
+              except ValueError as exc:
+                  raise SystemExit(
+                      f"README assets directory escapes repository root: {resolved}"
+                  ) from exc
+              return resolved
+
+          artefacts_dir = resolve_artefacts_dir()
           text = out_path.read_text(encoding="utf-8")
           artefacts_dir.mkdir(parents=True, exist_ok=True)
 
@@ -188,24 +367,35 @@ jobs:
                   return ref
 
               normalized = path[2:] if path.startswith("./") else path
-              artefacts_prefix = f"{artefacts_dir.as_posix().rstrip('/')}/"
+              artefacts_prefix = f"{artefacts_ref.as_posix().rstrip('/')}/"
               if normalized.startswith(artefacts_prefix):
                   rewritten[ref] = ref
                   return ref
 
-              source = (repo_root / normalized).resolve()
+              unresolved_source = repo_root / normalized
+              current = repo_root
+              for part in Path(normalized).parts:
+                  current = current / part
+                  if current.is_symlink():
+                      raise SystemExit(f"README image path must not be a symlink: {ref}")
+
+              source = unresolved_source.resolve()
               try:
-                  source.relative_to(repo_root)
+                  source_rel = source.relative_to(repo_root)
               except ValueError as exc:
                   raise SystemExit(f"README image path escapes repository root: {ref}") from exc
+              if blocked_parts & set(source_rel.parts):
+                  raise SystemExit(f"README image path points to blocked directory: {ref}")
               if not source.is_file():
                   raise SystemExit(f"README image path not found: {ref}")
+              if source.suffix.lower() not in allowed_extensions:
+                  raise SystemExit(f"README image path has unsupported extension: {ref}")
 
-              dest_name = "__".join(Path(normalized).parts)
-              dest = artefacts_dir / dest_name
+              dest_name = "__".join(source_rel.parts)
+              dest = resolve_artefacts_dir() / dest_name
               shutil.copy2(source, dest)
 
-              staged = f"{artefacts_dir.as_posix().rstrip('/')}/{dest_name}"
+              staged = f"{artefacts_ref.as_posix().rstrip('/')}/{dest_name}"
               if parsed.query:
                   staged = f"{staged}?{parsed.query}"
               if parsed.fragment:
@@ -223,76 +413,15 @@ jobs:
           out_path.write_text(text, encoding="utf-8")
           PY
 
-      - name: Upload README assets to GitHub Release assets
-        if: inputs.enabled && inputs.upload_release_assets && inputs.assets_mode == 'release'
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-          ARTEFACTS_DIR: ${{ inputs.artefacts_dir }}
-          RELEASE_TAG: ${{ inputs.release_tag }}
-        run: |
-          set -euo pipefail
-          shopt -s nullglob
-          files=("$ARTEFACTS_DIR"/*)
-          if [ ${#files[@]} -eq 0 ]; then
-            echo "No README assets found, skipping."
-            exit 0
-          fi
-
-          tag="$RELEASE_TAG"
-          if ! gh release view "$tag" >/dev/null 2>&1; then
-            gh release create "$tag" \
-              --title "PyPI assets" \
-              --notes "Rendered README assets used by the PyPI project description." \
-              --prerelease
-          fi
-
-          gh release upload "$tag" "${files[@]}" --clobber
-
-      - name: Upload README assets to GitHub assets branch
-        if: inputs.enabled && inputs.upload_release_assets && inputs.assets_mode == 'branch'
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-          ARTEFACTS_DIR: ${{ inputs.artefacts_dir }}
-          ASSETS_REF: ${{ inputs.release_tag }}
-          REPO: ${{ github.repository }}
-        run: |
-          set -euo pipefail
-          if [ -z "$(find "$ARTEFACTS_DIR" -mindepth 1 -print -quit)" ]; then
-            echo "No README assets found, skipping."
-            exit 0
-          fi
-
-          tmpdir="$RUNNER_TEMP/pypi-assets"
-          rm -rf "$tmpdir"
-          mkdir -p "$tmpdir/$ARTEFACTS_DIR"
-          cp -R "$ARTEFACTS_DIR"/. "$tmpdir/$ARTEFACTS_DIR/"
-
-          cat >"$tmpdir/README.md" <<'EOF'
-          # PyPI assets
-
-          This branch is generated by CI to host rendered README assets for PyPI.
-          EOF
-
-          git -C "$tmpdir" init
-          git -C "$tmpdir" checkout -b "$ASSETS_REF"
-          git -C "$tmpdir" config user.name "github-actions[bot]"
-          git -C "$tmpdir" config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git -C "$tmpdir" add .
-          git -C "$tmpdir" commit -m "Update PyPI assets"
-          git -C "$tmpdir" remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git"
-          git -C "$tmpdir" push --force origin "$ASSETS_REF"
-
       - name: Rewrite README asset URLs to GitHub Release assets
         if: inputs.enabled && inputs.upload_release_assets && inputs.assets_mode == 'release'
         env:
           OUT_PATH: ${{ inputs.output_readme_path }}
-          ARTEFACTS_DIR: ${{ inputs.artefacts_dir }}
-          RELEASE_TAG: ${{ inputs.release_tag }}
+          ARTEFACTS_DIR: ${{ steps.asset-inputs.outputs.artefacts_dir }}
+          RELEASE_TAG: ${{ steps.asset-ref.outputs.release_tag }}
           REPO: ${{ github.repository }}
         run: |
-          python - <<'PY'
+          python3 - <<'PY'
           from __future__ import annotations
 
           import os
@@ -322,11 +451,11 @@ jobs:
         if: inputs.enabled && inputs.upload_release_assets && inputs.assets_mode == 'branch'
         env:
           OUT_PATH: ${{ inputs.output_readme_path }}
-          ARTEFACTS_DIR: ${{ inputs.artefacts_dir }}
-          ASSETS_REF: ${{ inputs.release_tag }}
+          ARTEFACTS_DIR: ${{ steps.asset-inputs.outputs.artefacts_dir }}
+          ASSETS_REF: ${{ steps.asset-ref.outputs.release_tag }}
           REPO: ${{ github.repository }}
         run: |
-          python - <<'PY'
+          python3 - <<'PY'
           from __future__ import annotations
 
           import os
@@ -358,6 +487,70 @@ jobs:
           out_path.write_text(text, encoding="utf-8")
           PY
 
+      - name: Validate staged README assets
+        if: inputs.enabled
+        env:
+          ARTEFACTS_DIR: ${{ steps.asset-inputs.outputs.artefacts_dir }}
+        run: |
+          python3 - <<'PY'
+          from __future__ import annotations
+
+          import os
+          from pathlib import Path
+
+          repo_root = Path.cwd().resolve()
+          artefacts_ref = Path(os.environ["ARTEFACTS_DIR"])
+          current = repo_root
+          for part in artefacts_ref.parts:
+              current = current / part
+              if current.is_symlink():
+                  raise SystemExit(
+                      f"README assets directory component must not be a symlink: {current}"
+                  )
+          artefacts_dir = (repo_root / artefacts_ref).resolve()
+          try:
+              artefacts_dir.relative_to(repo_root)
+          except ValueError as exc:
+              raise SystemExit(
+                  f"README assets directory escapes repository root: {artefacts_dir}"
+              ) from exc
+          allowed_extensions = {
+              ".avif",
+              ".bmp",
+              ".gif",
+              ".ico",
+              ".jpeg",
+              ".jpg",
+              ".png",
+              ".svg",
+              ".webp",
+          }
+
+          if not artefacts_dir.exists():
+              print(f"No README assets found at {artefacts_dir}; skipping asset validation.")
+              raise SystemExit(0)
+          if artefacts_dir.is_symlink():
+              raise SystemExit(f"README assets directory must not be a symlink: {artefacts_dir}")
+
+          for current_root, dirs, files in os.walk(artefacts_dir):
+              current = Path(current_root)
+              for name in dirs:
+                  path = current / name
+                  if path.is_symlink():
+                      raise SystemExit(f"README asset must not be a symlink: {path}")
+                  raise SystemExit(f"README assets directory must be flat: {path}")
+              for name in files:
+                  path = current / name
+                  if path.is_symlink():
+                      raise SystemExit(f"README asset must not be a symlink: {path}")
+                  if path.name.startswith("."):
+                      raise SystemExit(f"README asset must not be hidden: {path}")
+                  if not path.is_file():
+                      raise SystemExit(f"README asset is not a regular file: {path}")
+                  if path.suffix.lower() not in allowed_extensions:
+                      raise SystemExit(f"README asset has unsupported extension: {path}")
+          PY
+
       - name: Upload artifact
         if: inputs.enabled
         uses: actions/upload-artifact@v6
@@ -365,5 +558,148 @@ jobs:
           name: ${{ inputs.artifact_name }}
           path: |
             ${{ inputs.output_readme_path }}
-            ${{ inputs.artefacts_dir }}/*.${{ inputs.output_format }}
+            ${{ steps.asset-inputs.outputs.artefacts_dir }}/**
           if-no-files-found: error
+
+  publish-assets:
+    needs: render
+    if: inputs.enabled && inputs.upload_release_assets
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download rendered README artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: ${{ inputs.artifact_name }}
+          path: pypi-readme-artifact
+
+      - name: Validate downloaded README assets
+        env:
+          ARTEFACTS_DIR: ${{ needs.render.outputs.artefacts_dir }}
+        run: |
+          python3 - <<'PY'
+          from __future__ import annotations
+
+          import os
+          from pathlib import Path
+
+          root = Path("pypi-readme-artifact").resolve()
+          artefacts_ref = Path(os.environ["ARTEFACTS_DIR"])
+          current = root
+          for part in artefacts_ref.parts:
+              current = current / part
+              if current.is_symlink():
+                  raise SystemExit(
+                      f"README assets directory component must not be a symlink: {current}"
+                  )
+          artefacts_dir = (root / artefacts_ref).resolve()
+          try:
+              artefacts_dir.relative_to(root)
+          except ValueError as exc:
+              raise SystemExit(
+                  f"README assets directory escapes downloaded artifact root: {artefacts_dir}"
+              ) from exc
+          allowed_extensions = {
+              ".avif",
+              ".bmp",
+              ".gif",
+              ".ico",
+              ".jpeg",
+              ".jpg",
+              ".png",
+              ".svg",
+              ".webp",
+          }
+
+          if not artefacts_dir.exists():
+              print(f"No README assets found at {artefacts_dir}; skipping asset validation.")
+              raise SystemExit(0)
+          if artefacts_dir.is_symlink():
+              raise SystemExit(f"README assets directory must not be a symlink: {artefacts_dir}")
+
+          for current_root, dirs, files in os.walk(artefacts_dir):
+              current = Path(current_root)
+              for name in dirs:
+                  path = current / name
+                  if path.is_symlink():
+                      raise SystemExit(f"README asset must not be a symlink: {path}")
+                  raise SystemExit(f"README assets directory must be flat: {path}")
+              for name in files:
+                  path = current / name
+                  if path.is_symlink():
+                      raise SystemExit(f"README asset must not be a symlink: {path}")
+                  if path.name.startswith("."):
+                      raise SystemExit(f"README asset must not be hidden: {path}")
+                  if not path.is_file():
+                      raise SystemExit(f"README asset is not a regular file: {path}")
+                  if path.suffix.lower() not in allowed_extensions:
+                      raise SystemExit(f"README asset has unsupported extension: {path}")
+          PY
+
+      - name: Upload README assets to GitHub Release assets
+        if: inputs.assets_mode == 'release'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARTEFACTS_DIR: ${{ needs.render.outputs.artefacts_dir }}
+          RELEASE_TAG: ${{ needs.render.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+          cd pypi-readme-artifact
+          shopt -s nullglob
+          if [ ! -d "$ARTEFACTS_DIR" ]; then
+            echo "No README assets found, skipping."
+            exit 0
+          fi
+          files=("$ARTEFACTS_DIR"/*)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "No README assets found, skipping."
+            exit 0
+          fi
+
+          tag="$RELEASE_TAG"
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            gh release create "$tag" \
+              --title "PyPI assets" \
+              --notes "Rendered README assets used by the PyPI project description." \
+              --prerelease
+          fi
+
+          gh release upload "$tag" --clobber -- "${files[@]}"
+
+      - name: Upload README assets to GitHub assets branch
+        if: inputs.assets_mode == 'branch'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARTEFACTS_DIR: ${{ needs.render.outputs.artefacts_dir }}
+          ASSETS_REF: ${{ needs.render.outputs.release_tag }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          cd pypi-readme-artifact
+          if [ ! -d "$ARTEFACTS_DIR" ] || [ -z "$(find "$ARTEFACTS_DIR" -type f -print -quit)" ]; then
+            echo "No README assets found, skipping."
+            exit 0
+          fi
+
+          tmpdir="$RUNNER_TEMP/pypi-assets"
+          rm -rf "$tmpdir"
+          mkdir -p "$tmpdir/$ARTEFACTS_DIR"
+          cp -R "$ARTEFACTS_DIR"/. "$tmpdir/$ARTEFACTS_DIR/"
+
+          cat >"$tmpdir/README.md" <<'EOF'
+          # PyPI assets
+
+          This branch is generated by CI to host rendered README assets for PyPI.
+          EOF
+
+          git -C "$tmpdir" init
+          git -C "$tmpdir" checkout -b "$ASSETS_REF"
+          git -C "$tmpdir" config user.name "github-actions[bot]"
+          git -C "$tmpdir" config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git -C "$tmpdir" add .
+          git -C "$tmpdir" commit -m "Update PyPI assets"
+          git -C "$tmpdir" remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git"
+          git -C "$tmpdir" push --force origin "HEAD:refs/heads/${ASSETS_REF}"
