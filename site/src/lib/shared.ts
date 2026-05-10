@@ -23,6 +23,8 @@ export const gitConfig = {
   branch: "main",
 };
 
+export const githubProjectUrl = `https://github.com/${gitConfig.user}/${gitConfig.repo}`;
+
 export const siteOrigin = (process.env.SITE_ORIGIN ?? "https://www.agentbusmcp.com").replace(
   /\/+$/,
   "",
