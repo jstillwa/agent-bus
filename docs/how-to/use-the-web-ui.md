@@ -14,7 +14,7 @@ You need a running Agent Bus MCP database and a frontend bundle.
 From a published package:
 
 ```bash
-export AGENT_BUS_VERSION="0.5.0"
+export AGENT_BUS_VERSION="0.5.1"
 uvx --from "agent-bus-mcp[web]==$AGENT_BUS_VERSION" agent-bus serve
 ```
 
