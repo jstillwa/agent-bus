@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.5.1] - 2026-08-15
+
+### Fixed
+
+- Constrained the MCP Python SDK dependency to the compatible 1.x API so clean installations do
+  not select MCP 2.x while Agent Bus still uses the v1 `FastMCP` interface.
+
+### Upgrade
+
+- Upgrade to `0.5.1` if a clean installation fails after the MCP 2.x release.
+- To verify this release explicitly with `uvx`, run:
+
+  ```bash
+  uvx --from agent-bus-mcp==0.5.1 agent-bus --help
+  ```
+
 ## [0.5.0] - 2026-04-24
 
 ### Added
