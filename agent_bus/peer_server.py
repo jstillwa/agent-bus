@@ -596,7 +596,7 @@ def topic_presence(
 
 @mcp.tool(description="Reset/set the server-side cursor for the joined peer on a topic.")
 def cursor_reset(
-    topic_id: str, *, last_seq: int = 0
+    topic_id: str, *, agent_name: str | None = None, last_seq: int = 0
 ) -> Annotated[CallToolResult, CursorResetOutput]:
     """Reset/set the server-side cursor for this peer on a topic.
 
@@ -607,11 +607,18 @@ def cursor_reset(
             code=ErrorCode.INVALID_ARGUMENT, message="topic_id must be a non-empty string"
         )
 
-    agent_name = _agent_name_for_topic(topic_id)
+    if agent_name is None:
+        agent_name = _agent_name_for_topic(topic_id)
+    else:
+        err = _validate_agent_name(agent_name)
+        if err:
+            return tool_error(code=ErrorCode.INVALID_ARGUMENT, message=err)
+        agent_name = agent_name.strip()
+
     if agent_name is None:
         return tool_error(
             code=ErrorCode.AGENT_NOT_JOINED,
-            message="Not joined to topic. Call topic_join() first.",
+            message="Not joined to topic. Call topic_join() first or pass agent_name.",
         )
 
     if not isinstance(last_seq, int) or last_seq < 0:
@@ -648,6 +655,12 @@ def cursor_reset(
 def sync(
     topic_id: str,
     *,
+    agent_name: Annotated[
+        str | None,
+        Field(
+            description="Your agent name. If omitted, uses the identity registered via topic_join().",
+        ),
+    ] = None,
     outbox: Annotated[
         list[dict[str, Any]] | dict[str, Any] | str | None,
         Field(
@@ -694,11 +707,18 @@ def sync(
             code=ErrorCode.INVALID_ARGUMENT, message="topic_id must be a non-empty string"
         )
 
-    agent_name = _agent_name_for_topic(topic_id)
+    if agent_name is None:
+        agent_name = _agent_name_for_topic(topic_id)
+    else:
+        err = _validate_agent_name(agent_name)
+        if err:
+            return tool_error(code=ErrorCode.INVALID_ARGUMENT, message=err)
+        agent_name = agent_name.strip()
+
     if agent_name is None:
         return tool_error(
             code=ErrorCode.AGENT_NOT_JOINED,
-            message="Not joined to topic. Call topic_join() first.",
+            message="Not joined to topic. Call topic_join() first or pass agent_name.",
         )
 
     if outbox is None:
@@ -718,6 +738,10 @@ def sync(
         outbox = [outbox]
     if not isinstance(outbox, list):
         return tool_error(code=ErrorCode.INVALID_ARGUMENT, message="outbox must be a list")
+
+    # Fast-write default: if posting outbox messages and caller left wait_seconds at 60s, don't block
+    if outbox and wait_seconds == 60:
+        wait_seconds = 0
 
     if not isinstance(max_items, int) or max_items <= 0:
         return tool_error(
