@@ -72,14 +72,31 @@ def setup_mcp_routes() -> None:
     """Mount MCP streamable-HTTP (/mcp) and SSE (/sse, /messages) transports.
 
     Routes are inserted ahead of the SPA catch-all so they win matching.
+    GET /mcp is answered 405 (spec-allowed): the standalone server->client SSE
+    stream is unused here and some HTTP/1.1 clients stall subsequent POSTs while
+    an unread streaming response body is open on the same origin.
     """
     from agent_bus.peer_server import mcp as mcp_server
 
     mcp_app = mcp_server.streamable_http_app()
     sse_app = mcp_server.sse_app()
 
+    class NoStandaloneStreamApp:
+        """ASGI wrapper; must be a callable object so Starlette Route keeps it as raw ASGI."""
+
+        def __init__(self, asgi_app: Any) -> None:
+            self._app = asgi_app
+
+        async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+            if scope["type"] == "http" and scope.get("method") == "GET":
+                await PlainTextResponse("Method Not Allowed", status_code=405)(scope, receive, send)
+                return
+            await self._app(scope, receive, send)
+
+    mcp_no_standalone_stream = NoStandaloneStreamApp(mcp_app)
+
     routes = [
-        Route("/mcp", mcp_app, methods=["GET", "POST", "DELETE", "OPTIONS"]),
+        Route("/mcp", mcp_no_standalone_stream, methods=["GET", "POST", "DELETE", "OPTIONS"]),
         *reversed(sse_app.routes),
     ]
     for route in reversed(routes):
