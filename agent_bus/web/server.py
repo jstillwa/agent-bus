@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import signal
 import time
@@ -19,7 +20,9 @@ from fastapi.responses import (
     Response,
     StreamingResponse,
 )
+from starlette.routing import Route
 
+from agent_bus.auth import SharedSecretAuthMiddleware
 from agent_bus.db import AgentBusDB, DBBusyError, TopicNotFoundError
 from agent_bus.models import Cursor, Message
 
@@ -36,9 +39,51 @@ SearchMode = Literal["fts", "semantic", "hybrid"]
 TopicStatusFilter = Literal["open", "closed", "all"]
 TopicSort = Literal["last_updated_desc", "created_desc", "created_asc"]
 
-app = FastAPI(title="Agent Bus MCP", docs_url=None, redoc_url=None)
+
+@contextlib.asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Run the MCP streamable-HTTP session manager for the lifetime of the server.
+    from agent_bus.peer_server import mcp as mcp_server
+
+    mcp_server.streamable_http_app()  # ensure lazy session manager is created
+    session_manager = mcp_server.session_manager
+    if getattr(session_manager, "_has_started", False):
+        # Session managers are single-run; tolerate repeated lifespans (e.g. tests).
+        yield
+        return
+    async with session_manager.run():
+        yield
+
+
+app = FastAPI(title="Agent Bus MCP", docs_url=None, redoc_url=None, lifespan=lifespan)
+app.add_middleware(SharedSecretAuthMiddleware)
 
 _db: AgentBusDB | None = None
+
+
+@app.get("/health")
+async def health() -> dict[str, Any]:
+    from agent_bus.version import __version__
+
+    return {"status": "ok", "version": __version__}
+
+
+def setup_mcp_routes() -> None:
+    """Mount MCP streamable-HTTP (/mcp) and SSE (/sse, /messages) transports.
+
+    Routes are inserted ahead of the SPA catch-all so they win matching.
+    """
+    from agent_bus.peer_server import mcp as mcp_server
+
+    mcp_app = mcp_server.streamable_http_app()
+    sse_app = mcp_server.sse_app()
+
+    routes = [
+        Route("/mcp", mcp_app, methods=["GET", "POST", "DELETE", "OPTIONS"]),
+        *reversed(sse_app.routes),
+    ]
+    for route in reversed(routes):
+        app.router.routes.insert(0, route)
 
 
 class SSEStreamingResponse(StreamingResponse):
@@ -551,14 +596,18 @@ async def spa_assets(path: str) -> Response:
 
 
 def run_server(host: str = "127.0.0.1", port: int = 8080, db_path: str | None = None) -> None:
+    import os
+
     import uvicorn
 
+    if db_path:
+        os.environ["AGENT_BUS_DB"] = db_path  # shared with agent_bus.peer_server.db
     init_db(db_path)
+    setup_mcp_routes()
     config = uvicorn.Config(
         app,
         host=host,
         port=port,
-        lifespan="off",
         timeout_graceful_shutdown=SERVER_SHUTDOWN_GRACE_SECONDS,
     )
     with suppress(KeyboardInterrupt):

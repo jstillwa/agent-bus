@@ -338,7 +338,6 @@ def test_run_server_sets_graceful_shutdown_timeout(monkeypatch) -> None:
     assert calls["kwargs"] == {
         "host": "0.0.0.0",
         "port": 9999,
-        "lifespan": "off",
         "timeout_graceful_shutdown": web_server.SERVER_SHUTDOWN_GRACE_SECONDS,
     }
     assert calls["ran"].kwargs == calls["kwargs"]

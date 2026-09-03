@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Annotated, Any, Literal, cast
 
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import CallToolResult
 from pydantic import Field
 
@@ -74,6 +75,7 @@ mcp = FastMCP(
         "Convention: message_type='question' for questions and message_type='answer' for replies. "
         "Tip: use client_message_id to make retries idempotent."
     ),
+    transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
 )
 
 
@@ -976,8 +978,35 @@ def sync(
     return tool_ok(text="\n".join(lines), structured=structured, warnings=tool_warnings or None)
 
 
-def main() -> None:
+def main(
+    transport: str | None = None,
+    host: str | None = None,
+    port: int | None = None,
+) -> None:
+    import os
+
     from agent_bus.embedding_worker import start_background_embedding_worker
 
     start_background_embedding_worker(db)
-    mcp.run(transport="stdio")
+
+    selected_transport = (
+        transport
+        or env_str(
+            "AGENT_BUS_TRANSPORT", default="streamable-http" if os.environ.get("PORT") else "stdio"
+        )
+    ).lower()
+
+    if selected_transport in ("streamable-http", "http"):
+        bind_host = host or env_str("AGENT_BUS_HOST", default="0.0.0.0")
+        bind_port = port or (int(os.environ["PORT"]) if os.environ.get("PORT") else 8000)
+        mcp.settings.host = bind_host
+        mcp.settings.port = bind_port
+        mcp.run(transport="streamable-http")
+    elif selected_transport == "sse":
+        bind_host = host or env_str("AGENT_BUS_HOST", default="0.0.0.0")
+        bind_port = port or (int(os.environ["PORT"]) if os.environ.get("PORT") else 8000)
+        mcp.settings.host = bind_host
+        mcp.settings.port = bind_port
+        mcp.run(transport="sse")
+    else:
+        mcp.run(transport="stdio")

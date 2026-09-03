@@ -1,0 +1,17 @@
+.git
+.github
+.venv
+__pycache__
+*.pyc
+node_modules
+frontend/node_modules
+site
+docs
+tests
+dist
+target
+.ruff_cache
+.pytest_cache
+Dockerfile
+docker-compose*.yml
+PLAN.md
