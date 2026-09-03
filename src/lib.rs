@@ -168,6 +168,10 @@ struct OutboxItem {
     client_message_id: Option<String>,
 }
 
+// Return shape of the sync_once transaction body: inserted messages (with a duplicate flag for
+// each), the messages read back, the caller's cursor, and whether more remain.
+type SyncOutcome = (Vec<(MessageRow, bool)>, Vec<MessageRow>, CursorRow, bool);
+
 struct EmbeddingChunk {
     chunk_index: i64,
     start_char: i64,
@@ -1217,48 +1221,52 @@ impl CoreDb {
         let topic_name = name.unwrap_or_else(|| format!("topic-{topic_id}"));
         let created_at = now_override.unwrap_or_else(now);
 
-        let mut conn = self.connect()?;
-        if mode == "reuse" {
-            let row = conn
-                .query_row(
-                    "
-                    SELECT topic_id, name, status, created_at, closed_at, close_reason, metadata_json
-                    FROM topics
-                    WHERE name = ? AND status = 'open'
-                    ORDER BY created_at DESC
-                    LIMIT 1
-                    ",
-                    params![topic_name],
-                    topic_row_from,
-                )
-                .optional()
-                .map_err(map_db_error)?;
-            if let Some(existing) = row {
-                return Ok(topic_to_dict(py, &existing));
+        // Release the GIL for the DB body: a write-first transaction can wait out
+        // the full SQLite busy_timeout (5s), which would freeze the asyncio loop.
+        let topic = py.detach(|| -> PyResult<TopicRow> {
+            let mut conn = self.connect()?;
+            if mode == "reuse" {
+                let row = conn
+                    .query_row(
+                        "
+                        SELECT topic_id, name, status, created_at, closed_at, close_reason, metadata_json
+                        FROM topics
+                        WHERE name = ? AND status = 'open'
+                        ORDER BY created_at DESC
+                        LIMIT 1
+                        ",
+                        params![topic_name],
+                        topic_row_from,
+                    )
+                    .optional()
+                    .map_err(map_db_error)?;
+                if let Some(existing) = row {
+                    return Ok(existing);
+                }
             }
-        }
 
-        let tx = conn.transaction().map_err(map_db_error)?;
-        tx.execute(
-            "
-            INSERT INTO topics(topic_id, name, created_at, status, closed_at, close_reason, metadata_json)
-            VALUES (?, ?, ?, 'open', NULL, NULL, ?)
-            ",
-            params![topic_id, topic_name, created_at, metadata_json],
-        )
-        .map_err(map_db_error)?;
-        bump_topics_version(&tx).map_err(map_db_error)?;
-        tx.commit().map_err(map_db_error)?;
+            let tx = conn.transaction().map_err(map_db_error)?;
+            tx.execute(
+                "
+                INSERT INTO topics(topic_id, name, created_at, status, closed_at, close_reason, metadata_json)
+                VALUES (?, ?, ?, 'open', NULL, NULL, ?)
+                ",
+                params![topic_id, topic_name, created_at, metadata_json],
+            )
+            .map_err(map_db_error)?;
+            bump_topics_version(&tx).map_err(map_db_error)?;
+            tx.commit().map_err(map_db_error)?;
 
-        let topic = TopicRow {
-            topic_id,
-            name: topic_name,
-            status: "open".to_string(),
-            created_at,
-            closed_at: None,
-            close_reason: None,
-            metadata_json,
-        };
+            Ok(TopicRow {
+                topic_id,
+                name: topic_name,
+                status: "open".to_string(),
+                created_at,
+                closed_at: None,
+                close_reason: None,
+                metadata_json,
+            })
+        })?;
         Ok(topic_to_dict(py, &topic))
     }
 
@@ -1966,6 +1974,10 @@ impl CoreDb {
         let updated_at = now_override.unwrap_or_else(now);
         let created_at = updated_at;
 
+        // Release the GIL for the full DB body: SQLite busy_timeout waits up to 5s,
+        // and holding the GIL through that wait freezes the asyncio event loop.
+        let (sent, received_slice, cursor, has_more) = py
+            .detach(|| -> PyResult<SyncOutcome> {
         let mut conn = self.connect()?;
         let tx = conn.transaction().map_err(map_db_error)?;
 
@@ -2300,6 +2312,9 @@ impl CoreDb {
         if had_writes {
             tx.commit().map_err(map_db_error)?;
         }
+
+        Ok((sent, received_slice, cursor, has_more))
+        })?;
 
         let sent_py = PyList::empty(py);
         for (msg, dup) in sent {
