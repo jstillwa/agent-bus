@@ -2069,15 +2069,17 @@ impl CoreDb {
             inserted_messages = true;
         }
 
-        tx.execute(
-            "
-            UPDATE topic_seq
-            SET next_seq = ?, updated_at = ?
-            WHERE topic_id = ?
-            ",
-            params![next_seq, updated_at, topic_id],
-        )
-        .map_err(map_db_error)?;
+        if inserted_messages {
+            tx.execute(
+                "
+                UPDATE topic_seq
+                SET next_seq = ?, updated_at = ?
+                WHERE topic_id = ?
+                ",
+                params![next_seq, updated_at, topic_id],
+            )
+            .map_err(map_db_error)?;
+        }
 
         if !auto_advance {
             if let Some(ack) = ack_through {
@@ -2140,7 +2142,7 @@ impl CoreDb {
             )
         };
 
-        let mut had_writes = inserted_messages || !outbox.is_empty();
+        let mut had_writes = inserted_messages;
 
         if auto_advance && !received_slice.is_empty() {
             let new_last_seq = received_slice
