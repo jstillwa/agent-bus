@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import time
 import unicodedata
 from dataclasses import dataclass
@@ -652,7 +653,7 @@ def cursor_reset(
         "only show text output; the text output includes message bodies (may be truncated)."
     )
 )
-def sync(
+async def sync(
     topic_id: str,
     *,
     agent_name: Annotated[
@@ -871,7 +872,8 @@ def sync(
     tool_warnings: list[ToolWarning] = []
 
     try:
-        sent, received, cursor, has_more = db.sync_once(
+        sent, received, cursor, has_more = await asyncio.to_thread(
+            db.sync_once,
             topic_id=topic_id,
             agent_name=agent_name,
             outbox=sanitized,
@@ -918,10 +920,11 @@ def sync(
     max_interval_s = poll_max_ms / 1000.0
 
     while not received and wait_seconds > 0 and time.monotonic() < deadline:
-        time.sleep(interval_s)
+        await asyncio.sleep(interval_s)
         interval_s = min(interval_s * 2, max_interval_s)
         try:
-            _, received, cursor, has_more = db.sync_once(
+            _, received, cursor, has_more = await asyncio.to_thread(
+                db.sync_once,
                 topic_id=topic_id,
                 agent_name=agent_name,
                 outbox=[],
