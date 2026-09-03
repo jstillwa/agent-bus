@@ -1908,16 +1908,7 @@ impl CoreDb {
             return Err(TopicClosedError::new_err("topic closed"));
         }
 
-        tx.execute(
-            "
-            INSERT OR IGNORE INTO cursors(topic_id, agent_name, last_seq, updated_at)
-            VALUES (?, ?, 0, ?)
-            ",
-            params![topic_id, agent_name, updated_at],
-        )
-        .map_err(map_db_error)?;
-
-        let cursor_row = tx
+        let cursor_opt: Option<CursorRow> = tx
             .query_row(
                 "
                 SELECT topic_id, agent_name, last_seq, updated_at
@@ -1927,26 +1918,61 @@ impl CoreDb {
                 params![topic_id, agent_name],
                 cursor_row_from,
             )
+            .optional()
             .map_err(map_db_error)?;
-        let mut cursor = cursor_row;
 
-        tx.execute(
-            "
-            INSERT OR IGNORE INTO topic_seq(topic_id, next_seq, updated_at)
-            VALUES (?, 1, ?)
-            ",
-            params![topic_id, updated_at],
-        )
-        .map_err(map_db_error)?;
+        let mut cursor = match cursor_opt {
+            Some(c) => c,
+            None => {
+                tx.execute(
+                    "
+                    INSERT OR IGNORE INTO cursors(topic_id, agent_name, last_seq, updated_at)
+                    VALUES (?, ?, 0, ?)
+                    ",
+                    params![topic_id, agent_name, updated_at],
+                )
+                .map_err(map_db_error)?;
+                tx.query_row(
+                    "
+                    SELECT topic_id, agent_name, last_seq, updated_at
+                    FROM cursors
+                    WHERE topic_id = ? AND agent_name = ?
+                    ",
+                    params![topic_id, agent_name],
+                    cursor_row_from,
+                )
+                .map_err(map_db_error)?
+            }
+        };
 
-        let next_seq: i64 = tx
+        let next_seq_opt: Option<i64> = tx
             .query_row(
                 "SELECT next_seq FROM topic_seq WHERE topic_id = ?",
                 params![topic_id],
                 |r| r.get(0),
             )
+            .optional()
             .map_err(map_db_error)?;
-        let mut next_seq = next_seq;
+
+        let mut next_seq = match next_seq_opt {
+            Some(s) => s,
+            None => {
+                tx.execute(
+                    "
+                    INSERT OR IGNORE INTO topic_seq(topic_id, next_seq, updated_at)
+                    VALUES (?, 1, ?)
+                    ",
+                    params![topic_id, updated_at],
+                )
+                .map_err(map_db_error)?;
+                tx.query_row(
+                    "SELECT next_seq FROM topic_seq WHERE topic_id = ?",
+                    params![topic_id],
+                    |r| r.get(0),
+                )
+                .map_err(map_db_error)?
+            }
+        };
 
         let mut sent: Vec<(MessageRow, bool)> = Vec::new();
         let mut inserted_messages = false;
@@ -2114,6 +2140,8 @@ impl CoreDb {
             )
         };
 
+        let mut had_writes = inserted_messages || !outbox.is_empty();
+
         if auto_advance && !received_slice.is_empty() {
             let new_last_seq = received_slice
                 .iter()
@@ -2132,10 +2160,11 @@ impl CoreDb {
                 .map_err(map_db_error)?;
                 cursor.last_seq = new_last_seq;
                 cursor.updated_at = updated_at;
+                had_writes = true;
             }
         }
 
-        if (cursor.updated_at - updated_at).abs() > f64::EPSILON {
+        if had_writes && (cursor.updated_at - updated_at).abs() > f64::EPSILON {
             tx.execute(
                 "
                 UPDATE cursors
@@ -2151,7 +2180,9 @@ impl CoreDb {
         if inserted_messages {
             bump_topics_version(&tx).map_err(map_db_error)?;
         }
-        tx.commit().map_err(map_db_error)?;
+        if had_writes {
+            tx.commit().map_err(map_db_error)?;
+        }
 
         let sent_py = PyList::empty(py);
         for (msg, dup) in sent {
@@ -2513,9 +2544,15 @@ impl CoreDb {
     fn connect(&self) -> PyResult<Connection> {
         ensure_parent_dir(&self.path).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let conn = Connection::open(&self.path).map_err(map_db_error)?;
-        conn.execute_batch("PRAGMA journal_mode=WAL;")
-            .map_err(map_db_error)?;
-        conn.busy_timeout(Duration::from_millis(2000))
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             PRAGMA synchronous=NORMAL;
+             PRAGMA temp_store=MEMORY;
+             PRAGMA cache_size=-64000;
+             PRAGMA busy_timeout=5000;",
+        )
+        .map_err(map_db_error)?;
+        conn.busy_timeout(Duration::from_millis(5000))
             .map_err(map_db_error)?;
         let mut schema_initialized = self
             .schema_initialized
