@@ -1,4 +1,8 @@
 import type {
+  CloseTopicPayload,
+  CloseTopicResponse,
+  PostMessagePayload,
+  PostMessageResponse,
   SearchMode,
   SearchResponse,
   TopicDetailResponse,
@@ -117,6 +121,32 @@ export async function deleteMessages(topicId: string, messageIds: string[]): Pro
       "Content-Type": "application/json",
     },
     body: JSON.stringify({ message_ids: messageIds }),
+  })
+}
+
+export async function postTopicMessage(
+  topicId: string,
+  payload: PostMessagePayload
+): Promise<PostMessageResponse> {
+  return fetchJson<PostMessageResponse>(`/topics/${topicId}/messages`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
+  })
+}
+
+export async function closeTopicAction(
+  topicId: string,
+  payload?: CloseTopicPayload
+): Promise<CloseTopicResponse> {
+  return fetchJson<CloseTopicResponse>(`/topics/${topicId}/close`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload ?? {}),
   })
 }
 

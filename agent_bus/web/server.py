@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Annotated, Any, Literal, cast
 
 from fastapi import Body, FastAPI, HTTPException, Query, Request
+from pydantic import BaseModel, Field
 from fastapi.responses import (
     FileResponse,
     HTMLResponse,
@@ -38,6 +39,17 @@ SERVER_SHUTDOWN_GRACE_SECONDS = 2
 SearchMode = Literal["fts", "semantic", "hybrid"]
 TopicStatusFilter = Literal["open", "closed", "all"]
 TopicSort = Literal["last_updated_desc", "created_desc", "created_asc"]
+
+
+class PostMessageRequest(BaseModel):
+    content_markdown: str = Field(..., min_length=1, max_length=65536)
+    sender: str = Field(default="operator", min_length=1, max_length=64)
+    message_type: str = Field(default="message", min_length=1, max_length=32)
+    reply_to: str | None = Field(default=None)
+
+
+class CloseTopicRequest(BaseModel):
+    reason: str | None = Field(default="closed via web UI")
 
 
 @contextlib.asynccontextmanager
@@ -472,6 +484,82 @@ async def api_topic_export(topic_id: str) -> PlainTextResponse:
         media_type="text/markdown",
         headers={"Content-Disposition": f'attachment; filename="{safe_name or "topic"}.md"'},
     )
+
+
+@app.post("/api/topics/{topic_id}/messages")
+async def api_post_message(
+    topic_id: str,
+    payload: PostMessageRequest,
+) -> dict[str, Any]:
+    db = get_db()
+    try:
+        topic = db.get_topic(topic_id=topic_id)
+    except TopicNotFoundError:
+        raise HTTPException(status_code=404, detail="Topic not found") from None
+
+    if topic.status != "open":
+        raise HTTPException(status_code=400, detail="Topic is closed")
+
+    outbox_item = {
+        "content_markdown": payload.content_markdown,
+        "message_type": payload.message_type,
+        "reply_to": payload.reply_to,
+        "metadata": None,
+        "client_message_id": None,
+    }
+
+    try:
+        sent, _, _, _ = await asyncio.to_thread(
+            db.sync_once,
+            topic_id=topic_id,
+            agent_name=payload.sender,
+            outbox=[outbox_item],
+            max_items=0,
+            include_self=False,
+            auto_advance=True,
+            ack_through=None,
+        )
+    except DBBusyError:
+        raise HTTPException(status_code=503, detail="Database is busy") from None
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from None
+
+    if not sent:
+        raise HTTPException(status_code=500, detail="Failed to insert message")
+
+    msg, dup = sent[0]
+    sender_by_msg_id = db.get_senders_by_message_ids([msg.reply_to]) if msg.reply_to else {}
+    return {
+        "status": "ok",
+        "message": serialize_message(msg, sender_by_msg_id),
+        "duplicate": dup,
+    }
+
+
+@app.post("/api/topics/{topic_id}/close")
+async def api_close_topic(
+    topic_id: str,
+    payload: CloseTopicRequest | None = None,
+) -> dict[str, Any]:
+    db = get_db()
+    reason = payload.reason if payload and payload.reason is not None else "closed via web UI"
+    try:
+        topic, closed_now = await asyncio.to_thread(
+            db.topic_close,
+            topic_id=topic_id,
+            reason=reason,
+        )
+    except TopicNotFoundError:
+        raise HTTPException(status_code=404, detail="Topic not found") from None
+    except DBBusyError:
+        raise HTTPException(status_code=503, detail="Database is busy") from None
+
+    summary = get_topic_summary(db, topic_id=topic_id)
+    return {
+        "status": "ok",
+        "topic": summary,
+        "closed_now": closed_now,
+    }
 
 
 @app.delete("/api/topics/{topic_id}")

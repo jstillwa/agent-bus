@@ -8,16 +8,18 @@ import {
   ArrowDownToLineIcon,
   ArrowDownWideNarrowIcon,
   ArrowUpDownIcon,
+  CheckCircle2Icon,
   CheckIcon,
   FolderSearch2Icon,
   ListFilterIcon,
   MessageSquareMoreIcon,
+  SendIcon,
   Trash2Icon,
   XIcon,
 } from "lucide-react"
 
 import { fetchSearchResults, fetchTopicDetail, fetchTopicMessages, fetchTopics } from "@/lib/api"
-import { deleteMessages, deleteTopic, exportTopicUrl } from "@/lib/api"
+import { closeTopicAction, deleteMessages, deleteTopic, exportTopicUrl, postTopicMessage } from "@/lib/api"
 import { formatAbsoluteTime, formatRelativeTime, initialsFor } from "@/lib/format"
 import type {
   CursorPresence,
@@ -50,6 +52,7 @@ import {
 } from "@/components/ui/dropdown-menu"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { Separator } from "@/components/ui/separator"
+import { Textarea } from "@/components/ui/textarea"
 import {
   Sidebar,
   SidebarContent,
@@ -916,6 +919,8 @@ function TopicView(props: {
   onMessageSelectionChange: (messageId: string, next: boolean) => void
   onLoadEarlier: () => void
   onDeleteTopic: () => void
+  onCloseTopic: () => void
+  onSendMessage: (content: string, sender: string, messageType: string) => Promise<void>
 }) {
   const {
     topicDetail,
@@ -935,7 +940,27 @@ function TopicView(props: {
     onMessageSelectionChange,
     onLoadEarlier,
     onDeleteTopic,
+    onCloseTopic,
+    onSendMessage,
   } = props
+
+  const [composerContent, setComposerContent] = useState("")
+  const [composerSender, setComposerSender] = useState(() => {
+    return localStorage.getItem("agent-bus.composer-sender") || "operator"
+  })
+  const [composerType, setComposerType] = useState("message")
+  const [isSubmitting, setIsSubmitting] = useState(false)
+
+  async function submitMessage() {
+    if (!composerContent.trim() || isSubmitting) return
+    setIsSubmitting(true)
+    try {
+      await onSendMessage(composerContent, composerSender, composerType)
+      setComposerContent("")
+    } finally {
+      setIsSubmitting(false)
+    }
+  }
 
   const trimmedFindQuery = findState.query.trim()
   const hasTrimmedFindQuery = Boolean(trimmedFindQuery)
@@ -1229,6 +1254,12 @@ function TopicView(props: {
                   Export
                 </a>
               </Button>
+              {topicDetail.topic.status === "open" ? (
+                <Button variant="outline" size="sm" onClick={onCloseTopic}>
+                  <CheckCircle2Icon data-icon="inline-start" />
+                  Close topic
+                </Button>
+              ) : null}
               <Button variant="outline" size="sm" onClick={onDeleteTopic}>
                 <Trash2Icon data-icon="inline-start" />
                 Delete topic
@@ -1393,6 +1424,67 @@ function TopicView(props: {
                   )}
                 </div>
               </ScrollArea>
+              {topicDetail.topic.status === "open" ? (
+                <div className="border-t border-border bg-[#1d2026] p-3 shrink-0">
+                  <div className="flex flex-col gap-2">
+                    <div className="flex items-center justify-between gap-2">
+                      <div className="flex items-center gap-2">
+                        <span className="text-xs text-muted-foreground">From:</span>
+                        <Input
+                          value={composerSender}
+                          onChange={(e) => {
+                            setComposerSender(e.target.value)
+                            localStorage.setItem("agent-bus.composer-sender", e.target.value)
+                          }}
+                          placeholder="operator"
+                          className="h-7 w-28 border-zinc-700 bg-[#111318] text-xs text-zinc-100 placeholder:text-zinc-500"
+                        />
+                        <span className="text-xs text-muted-foreground ml-1">Type:</span>
+                        <select
+                          value={composerType}
+                          onChange={(e) => setComposerType(e.target.value)}
+                          className="h-7 rounded-md border border-zinc-700 bg-[#111318] px-2 text-xs text-zinc-100 outline-none focus:border-sky-500"
+                        >
+                          <option value="message">message</option>
+                          <option value="question">question</option>
+                          <option value="answer">answer</option>
+                          <option value="state">state</option>
+                        </select>
+                      </div>
+                      <div className="text-[11px] text-muted-foreground hidden sm:block">
+                        Press <kbd className="rounded bg-muted px-1 py-0.5 font-mono text-[10px]">⌘</kbd> + <kbd className="rounded bg-muted px-1 py-0.5 font-mono text-[10px]">Enter</kbd> to send
+                      </div>
+                    </div>
+                    <div className="flex gap-2 items-end">
+                      <Textarea
+                        value={composerContent}
+                        onChange={(e) => setComposerContent(e.target.value)}
+                        onKeyDown={(e) => {
+                          if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
+                            e.preventDefault()
+                            void submitMessage()
+                          }
+                        }}
+                        placeholder="Type a message into this topic thread..."
+                        className="min-h-[60px] max-h-48 resize-y border-zinc-700 bg-[#111318] text-sm text-zinc-100 placeholder:text-zinc-500 focus-visible:border-sky-500 focus-visible:ring-sky-500/25"
+                      />
+                      <Button
+                        size="sm"
+                        disabled={isSubmitting || !composerContent.trim()}
+                        onClick={() => void submitMessage()}
+                        className="h-[60px] px-4 bg-sky-600 hover:bg-sky-500 text-white shrink-0"
+                      >
+                        <SendIcon className="size-4" />
+                        <span className="sr-only">Send</span>
+                      </Button>
+                    </div>
+                  </div>
+                </div>
+              ) : (
+                <div className="border-t border-border bg-muted/20 px-4 py-2.5 text-center text-xs text-muted-foreground shrink-0">
+                  This topic is closed{topicDetail.topic.close_reason ? ` (${topicDetail.topic.close_reason})` : ""}.
+                </div>
+              )}
             </div>
           </div>
         </CardContent>
@@ -2253,6 +2345,63 @@ export default function App() {
     }
   }
 
+  async function handleCloseTopic() {
+    if (!topicDetail || topicDetail.topic.status !== "open") {
+      return
+    }
+    const reason = window.prompt(`Reason for closing topic "${topicDetail.topic.name}":`, "closed via web UI")
+    if (reason === null) {
+      return
+    }
+
+    try {
+      const res = await closeTopicAction(topicDetail.topic.topic_id, { reason })
+      toast.success(`Closed topic "${topicDetail.topic.name}"`)
+      setTopicDetail((current) => {
+        if (!current) return current
+        return {
+          ...current,
+          topic: res.topic,
+        }
+      })
+      const nextTopics = await fetchTopics({
+        status: workbenchState.sidebarStatus,
+        sort: workbenchState.sidebarSort,
+        query: "",
+      })
+      setTopics(nextTopics)
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "Failed to close topic")
+    }
+  }
+
+  async function handleSendMessage(contentMarkdown: string, sender: string, messageType: string) {
+    if (!topicDetail || !contentMarkdown.trim()) {
+      return
+    }
+
+    try {
+      const res = await postTopicMessage(topicDetail.topic.topic_id, {
+        content_markdown: contentMarkdown.trim(),
+        sender: sender.trim() || "operator",
+        message_type: messageType || "message",
+      })
+      toast.success("Message sent")
+      setTopicDetail((current) => {
+        if (!current) return current
+        const nextMessages = [...current.messages, res.message]
+        return {
+          ...current,
+          messages: nextMessages,
+          last_seq: res.message.seq,
+          message_count: current.message_count + 1,
+        }
+      })
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "Failed to send message")
+    }
+  }
+
   async function handleDeleteSelected() {
     if (!routeTopicId || selectedMessageIds.size === 0) {
       return
@@ -2441,6 +2590,8 @@ export default function App() {
                     }
                     onLoadEarlier={() => void loadEarlierMessages()}
                     onDeleteTopic={() => void handleDeleteTopic()}
+                    onCloseTopic={() => void handleCloseTopic()}
+                    onSendMessage={(content, sender, type) => handleSendMessage(content, sender, type)}
                   />
                 ) : (
                   <Card className="flex flex-1 rounded-none border-border bg-card shadow-none">

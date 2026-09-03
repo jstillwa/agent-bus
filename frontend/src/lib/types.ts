@@ -96,3 +96,26 @@ export interface WorkbenchState {
   sidebarStatus: TopicStatusFilter
   sidebarSort: TopicSort
 }
+
+export interface PostMessagePayload {
+  content_markdown: string
+  sender?: string
+  message_type?: string
+  reply_to?: string | null
+}
+
+export interface PostMessageResponse {
+  status: string
+  message: TopicMessage
+  duplicate: boolean
+}
+
+export interface CloseTopicPayload {
+  reason?: string | null
+}
+
+export interface CloseTopicResponse {
+  status: string
+  topic: TopicSummary
+  closed_now: boolean
+}
