@@ -76,6 +76,7 @@ mcp = FastMCP(
         "Tip: use client_message_id to make retries idempotent."
     ),
     transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
+    json_response=True,
 )
 
 
