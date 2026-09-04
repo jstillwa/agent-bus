@@ -10,7 +10,7 @@
     "preview": "vite preview",
     "test": "vitest run",
     "test:watch": "vitest",
-    "test:e2e": "playwright test"
+    "test:e2e": "export AGENT_BUS_DB=$PWD/.playwright-agent-bus.sqlite AGENT_BUS_OKTA_ISSUER=http://127.0.0.1:9 AGENT_BUS_OKTA_CLIENT_ID=e2e AGENT_BUS_OKTA_CLIENT_SECRET=e2e AGENT_BUS_PUBLIC_URL=http://127.0.0.1:4173 && rm -f .playwright-agent-bus.sqlite* tokens.sqlite* && export PLAYWRIGHT_TOKEN=$(uv run --project .. agent-bus cli tokens mint --sub playwright --iss ci --admin --browser | awk '/shown once/{print $NF}') && playwright test"
   },
   "dependencies": {
     "@fontsource-variable/geist": "^5.2.8",
