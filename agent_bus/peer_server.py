@@ -11,6 +11,7 @@ from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import CallToolResult
 from pydantic import Field
 
+from agent_bus.auth import AuthIdentity, identity_from_scope
 from agent_bus.common import (
     ErrorCode,
     ToolWarning,
@@ -28,6 +29,13 @@ from agent_bus.db import (
     SchemaMismatchError,
     TopicClosedError,
     TopicNotFoundError,
+)
+from agent_bus.ownership import (
+    is_visible,
+    is_visible_topic_id,
+    resolve_owned_topic,
+    sanitize_topic_metadata,
+    visible_topics,
 )
 from agent_bus.tool_schemas import (
     CursorResetOutput,
@@ -112,6 +120,22 @@ def _agent_name_for_topic(topic_id: str) -> str | None:
     return identity.agent_name if identity is not None else None
 
 
+def _current_auth() -> AuthIdentity | None:
+    """Authenticated identity of the calling HTTP request, or None.
+
+    None on stdio (local-file trust: no HTTP request, no enforcement) and for
+    any context-less invocation. A genuine HTTP request carries identity via
+    TokenAuthMiddleware; absence there fails at the middleware, not here.
+    """
+    try:
+        request = mcp.get_context().request_context.request
+    except (LookupError, ValueError):
+        return None
+    if request is None:
+        return None
+    return identity_from_scope(request.scope)
+
+
 def _suggest_agent_names(agent_name: str) -> list[str]:
     roles = ["reviewer", "frontend", "architect", "implementer", "researcher"]
     fallbacks = ["blue", "curious", "steady", "swift"]
@@ -128,6 +152,25 @@ def _suggest_agent_names(agent_name: str) -> list[str]:
             seen.add(candidate)
             suggestions.append(candidate)
     return suggestions
+
+
+def _topic_access_error(topic_id: str) -> Any | None:
+    """Error result when the caller cannot see this topic; None when access is fine.
+
+    Foreign topics are indistinguishable from missing ones (TOPIC_NOT_FOUND).
+    stdio callers (no HTTP identity) and admins skip the check.
+    """
+    auth = _current_auth()
+    if auth is None or auth.admin:
+        return None
+    try:
+        if not is_visible_topic_id(db, auth, topic_id):
+            return tool_error(code=ErrorCode.TOPIC_NOT_FOUND, message="Topic not found.")
+    except DBBusyError:
+        return tool_error(code=ErrorCode.DB_BUSY, message="Database is busy.")
+    except SchemaMismatchError as e:
+        return _schema_mismatch_result(e)
+    return None
 
 
 def _schema_mismatch_result(e: SchemaMismatchError) -> Any:
@@ -188,8 +231,36 @@ def topic_create(
     """
     if metadata is not None and not isinstance(metadata, dict):
         return tool_error(code=ErrorCode.INVALID_ARGUMENT, message="metadata must be an object")
+
+    auth = _current_auth()
+    metadata = sanitize_topic_metadata(metadata, auth)
+
     try:
-        topic = db.topic_create(name=name, metadata=metadata, mode=mode)
+        # Non-admin reuse resolves within the caller's own topics only; a
+        # foreign same-named topic is invisible and never handed over.
+        if auth is not None and not auth.admin and mode == "reuse" and name:
+            try:
+                topic = resolve_owned_topic(db, auth, name=name, allow_closed=False)
+                text = (
+                    f'Topic: name="{topic.name}", topic_id="{topic.topic_id}", '
+                    f'status="{topic.status}"'
+                )
+                return tool_ok(
+                    text=text,
+                    structured={
+                        "topic_id": topic.topic_id,
+                        "name": topic.name,
+                        "status": topic.status,
+                    },
+                )
+            except TopicNotFoundError:
+                pass  # no owned open match: fall through and create a new topic
+
+        topic = db.topic_create(
+            name=name,
+            metadata=metadata,
+            mode=("new" if auth is not None and not auth.admin else mode),
+        )
     except SchemaMismatchError as e:
         return _schema_mismatch_result(e)
     except DBBusyError:
@@ -205,13 +276,16 @@ def topic_create(
 def topic_list(
     status: Literal["open", "closed", "all"] = "open",
 ) -> Annotated[CallToolResult, TopicListOutput]:
-    """List topics in the shared Agent Bus DB."""
+    """List topics in the shared Agent Bus DB (scoped to the caller's topics)."""
     try:
         topics = db.topic_list(status=status)
     except SchemaMismatchError as e:
         return _schema_mismatch_result(e)
     except DBBusyError:
         return tool_error(code=ErrorCode.DB_BUSY, message="Database is busy.")
+
+    auth = _current_auth()
+    topics = visible_topics(auth, topics)
 
     structured_topics = [
         {
@@ -272,15 +346,31 @@ def messages_search(
         from agent_bus.search import DEFAULT_EMBEDDING_MODEL, search_messages
 
         default_model = env_str("AGENT_BUS_EMBEDDING_MODEL", default=DEFAULT_EMBEDDING_MODEL)
+
+        auth = _current_auth()
+        fetch_limit = limit
+        if auth is not None and not auth.admin:
+            if topic_id is not None:
+                if not is_visible_topic_id(db, auth, topic_id):
+                    return tool_error(code=ErrorCode.TOPIC_NOT_FOUND, message="Topic not found.")
+            else:
+                # ponytail: over-fetch + post-filter for scoped global search;
+                # core WHERE owner=? if scale demands.
+                fetch_limit = limit * 4
+
         results, warnings_list = search_messages(
             db,
             query=query,
             mode=mode,
             topic_id=topic_id,
-            limit=limit,
+            limit=fetch_limit,
             model=model or default_model,
             include_content=include_content,
         )
+
+        if auth is not None and not auth.admin and topic_id is None:
+            owned_ids = {t.topic_id for t in visible_topics(auth, db.topic_list(status="all"))}
+            results = [r for r in results if r.get("topic_id") in owned_ids][:limit]
     except SchemaMismatchError as e:
         return _schema_mismatch_result(e)
     except DBBusyError:
@@ -348,6 +438,9 @@ def topic_close(
     topic_id: str, reason: str | None = None
 ) -> Annotated[CallToolResult, TopicCloseOutput]:
     """Close a topic (idempotent)."""
+    err = _topic_access_error(topic_id)
+    if err is not None:
+        return err
     try:
         topic, already_closed = db.topic_close(topic_id=topic_id, reason=reason)
     except SchemaMismatchError as e:
@@ -387,8 +480,12 @@ def topic_resolve(
         return tool_error(
             code=ErrorCode.INVALID_ARGUMENT, message="name must be a non-empty string"
         )
+    auth = _current_auth()
     try:
-        topic = db.topic_resolve(name=name, allow_closed=allow_closed)
+        if auth is not None and not auth.admin:
+            topic = resolve_owned_topic(db, auth, name=name, allow_closed=allow_closed)
+        else:
+            topic = db.topic_resolve(name=name, allow_closed=allow_closed)
     except SchemaMismatchError as e:
         return _schema_mismatch_result(e)
     except TopicNotFoundError:
@@ -464,6 +561,7 @@ def topic_join(
     if not topic_id and not name:
         return tool_error(code=ErrorCode.INVALID_ARGUMENT, message="Provide topic_id or name")
 
+    auth = _current_auth()
     try:
         if topic_id:
             if not isinstance(topic_id, str) or not topic_id:
@@ -471,12 +569,20 @@ def topic_join(
                     code=ErrorCode.INVALID_ARGUMENT, message="topic_id must be a non-empty string"
                 )
             topic = db.get_topic(topic_id=topic_id)
+            if auth is not None and not auth.admin and not is_visible(auth, topic):
+                return tool_error(code=ErrorCode.TOPIC_NOT_FOUND, message="Topic not found.")
         else:
             if not isinstance(name, str) or not name:
                 return tool_error(
                     code=ErrorCode.INVALID_ARGUMENT, message="name must be a non-empty string"
                 )
-            topic = db.topic_resolve(name=cast(str, name), allow_closed=allow_closed)
+            if auth is not None and not auth.admin:
+                # Foreign same-named topics are invisible: resolve within owned only.
+                topic = resolve_owned_topic(
+                    db, auth, name=cast(str, name), allow_closed=allow_closed
+                )
+            else:
+                topic = db.topic_resolve(name=cast(str, name), allow_closed=allow_closed)
     except SchemaMismatchError as e:
         return _schema_mismatch_result(e)
     except TopicNotFoundError:
@@ -553,6 +659,10 @@ def topic_presence(
     if not isinstance(limit, int) or limit <= 0:
         return tool_error(code=ErrorCode.INVALID_ARGUMENT, message="limit must be > 0")
 
+    err = _topic_access_error(topic_id)
+    if err is not None:
+        return err
+
     try:
         cursors = db.get_presence(topic_id=topic_id, window_seconds=window_seconds, limit=limit)
     except SchemaMismatchError as e:
@@ -624,6 +734,10 @@ def cursor_reset(
 
     if not isinstance(last_seq, int) or last_seq < 0:
         return tool_error(code=ErrorCode.INVALID_ARGUMENT, message="last_seq must be an int >= 0")
+
+    err = _topic_access_error(topic_id)
+    if err is not None:
+        return err
 
     try:
         cursor = db.cursor_set(topic_id=topic_id, agent_name=agent_name, last_seq=last_seq)
@@ -707,6 +821,10 @@ async def sync(
         return tool_error(
             code=ErrorCode.INVALID_ARGUMENT, message="topic_id must be a non-empty string"
         )
+
+    err = _topic_access_error(topic_id)
+    if err is not None:
+        return err
 
     if agent_name is None:
         agent_name = _agent_name_for_topic(topic_id)
@@ -1024,17 +1142,17 @@ def main(
         )
     ).lower()
 
-    if selected_transport in ("streamable-http", "http"):
-        bind_host = host or env_str("AGENT_BUS_HOST", default="0.0.0.0")
-        bind_port = port or (int(os.environ["PORT"]) if os.environ.get("PORT") else 8000)
-        mcp.settings.host = bind_host
-        mcp.settings.port = bind_port
-        mcp.run(transport="streamable-http")
-    elif selected_transport == "sse":
-        bind_host = host or env_str("AGENT_BUS_HOST", default="0.0.0.0")
-        bind_port = port or (int(os.environ["PORT"]) if os.environ.get("PORT") else 8000)
-        mcp.settings.host = bind_host
-        mcp.settings.port = bind_port
-        mcp.run(transport="sse")
-    else:
-        mcp.run(transport="stdio")
+    if selected_transport in ("streamable-http", "http", "sse"):
+        # Trust boundary: standalone HTTP MCP runs without TokenAuthMiddleware, so
+        # it must not be reachable. Use `agent-bus serve` (FastAPI + token auth).
+        import sys
+
+        print(
+            "Refusing to start a standalone unauthenticated HTTP MCP server. "
+            "Run `agent-bus serve` instead (token-authenticated HTTP deployment). "
+            "stdio transport needs no auth.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    mcp.run(transport="stdio")

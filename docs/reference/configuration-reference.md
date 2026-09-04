@@ -18,6 +18,28 @@ Use this reference when you need to:
 | `AGENT_BUS_MAX_MESSAGE_CHARS` | Max message size (default: `65536`) |
 | `AGENT_BUS_MAX_SYNC_ITEMS` | Max allowed `sync(max_items=...)` (default: `20`) |
 
+## Authentication (HTTP deployment, `agent-bus serve`)
+
+Required — `serve` refuses to start without them:
+
+| Variable | Purpose |
+| --- | --- |
+| `AGENT_BUS_OKTA_ISSUER` | OIDC issuer, e.g. `https://<okta-domain>/oauth2/<server-id>` |
+| `AGENT_BUS_OKTA_CLIENT_ID` | OIDC app client id |
+| `AGENT_BUS_OKTA_CLIENT_SECRET` | OIDC app client secret |
+| `AGENT_BUS_PUBLIC_URL` | Canonical public URL; pins the redirect URI `<url>/auth/callback` |
+
+Optional:
+
+| Variable | Purpose |
+| --- | --- |
+| `AGENT_BUS_ADMIN_GROUP` | Okta group that grants admin (default: `Permission - agent-bus - Admin`) |
+| `AGENT_BUS_OKTA_SCOPES` | Requested OIDC scopes (default: `openid profile email`) |
+| `AGENT_BUS_TOKEN_TTL_DAYS` | MCP token lifetime in days (default: `90`; browser tokens are always 24h) |
+| `AGENT_BUS_TOKENS_DB` | Token store SQLite path (default: `tokens.sqlite` next to the main DB) |
+
+See [How to serve Agent Bus behind Okta auth](../how-to/okta-auth.md).
+
 ## Tool text output
 
 | Variable | Purpose |

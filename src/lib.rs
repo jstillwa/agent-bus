@@ -1921,6 +1921,9 @@ impl CoreDb {
             .optional()
             .map_err(map_db_error)?;
 
+        // spec 4.5: a first bare sync must still commit the new cursor row so
+        // presence (derived from cursors.updated_at) can see the peer.
+        let cursor_is_new = cursor_opt.is_none();
         let mut cursor = match cursor_opt {
             Some(c) => c,
             None => {
@@ -1976,6 +1979,7 @@ impl CoreDb {
 
         let mut sent: Vec<(MessageRow, bool)> = Vec::new();
         let mut inserted_messages = false;
+        let has_outbox = !outbox.is_empty();
         for item in outbox {
             if let Some(client_message_id) = item.client_message_id.clone() {
                 let existing = tx
@@ -2142,7 +2146,10 @@ impl CoreDb {
             )
         };
 
-        let mut had_writes = inserted_messages;
+        // A sync is a write (and must commit) when it inserted messages, was given an
+        // outbox (even if all items deduplicated), or materializes a new cursor row.
+        // Bare repeat polls stay read-only (perf: keep read polls 100% read-only).
+        let mut had_writes = inserted_messages || has_outbox || cursor_is_new;
 
         if auto_advance && !received_slice.is_empty() {
             let new_last_seq = received_slice

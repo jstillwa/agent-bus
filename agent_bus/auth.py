@@ -1,102 +1,132 @@
+"""Token authentication middleware for the Agent Bus HTTP deployment.
+
+Every HTTP request must present a token minted via the Okta login flow
+(or the admin CLI): `Authorization: Bearer <token>`, `X-API-Key: <token>`,
+or the `agent_bus_token` cookie (browser sessions). On success the
+authenticated identity is attached to `scope["state"]["auth"]`; MCP tools
+and web handlers authorize from there. stdio transport never passes through
+this middleware (decision: stdio is local-file trust).
+
+The old shared-secret auth (`AGENT_BUS_AUTH_TOKEN`) was deleted; Okta
+tokens are the only HTTP auth path. `?token=` query-param auth is
+intentionally not supported (credentials must not leak into logs/history).
+"""
+
 from __future__ import annotations
 
 import os
-import urllib.parse
+from collections.abc import MutableMapping
+from dataclasses import dataclass
 from typing import Any
 
 from starlette.datastructures import Headers
 from starlette.responses import JSONResponse
 
+# Paths reachable without a token: healthchecks and the login flow itself.
+PUBLIC_PATHS = ("/health",)
+PUBLIC_PREFIXES = ("/auth/",)
 
-def get_auth_secret() -> str | None:
-    """Retrieve the shared secret from environment variables."""
-    token = os.environ.get("AGENT_BUS_AUTH_TOKEN") or os.environ.get("AGENT_BUS_SECRET")
-    if token:
-        token = token.strip()
-    return token or None
+COOKIE_NAME = "agent_bus_token"
 
 
-class SharedSecretAuthMiddleware:
-    """ASGI middleware providing shared-secret authentication.
+@dataclass(frozen=True, slots=True)
+class AuthIdentity:
+    iss: str
+    sub: str
+    admin: bool
+    browser: bool
+    token_id: str
 
-    Supports:
-    - Authorization: Bearer <secret>
-    - X-API-Key: <secret>
-    - Query parameter: ?token=<secret>
-    - Cookie: agent_bus_token=<secret>
 
-    If AGENT_BUS_AUTH_TOKEN is not set, all requests are permitted.
-    The /health endpoint is always permitted for healthchecks.
+def login_url() -> str:
+    public = os.environ.get("AGENT_BUS_PUBLIC_URL")
+    return f"{public.rstrip('/')}/auth/login" if public else "/auth/login"
+
+
+def _cookie_token(headers: Headers) -> str | None:
+    for cookie in headers.get("cookie", "").split(";"):
+        cookie = cookie.strip()
+        if cookie.startswith(f"{COOKIE_NAME}="):
+            return cookie.split("=", 1)[1]
+    return None
+
+
+class TokenAuthMiddleware:
+    """ASGI middleware authenticating requests against the token store.
+
+    The store is resolved lazily per request via `tokens.get_token_store()`
+    so tests (and the CLI) can inject a store before the server starts.
     """
 
-    def __init__(self, app: Any, secret: str | None = None) -> None:
+    def __init__(self, app: Any) -> None:
         self.app = app
-        self.secret = secret if secret is not None else get_auth_secret()
 
     async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
-        if scope["type"] != "http" or not self.secret:
+        if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
 
         path = scope.get("path", "")
-        if path == "/health":
+        if path in PUBLIC_PATHS or path.startswith(PUBLIC_PREFIXES):
             await self.app(scope, receive, send)
             return
 
-        headers = Headers(scope=scope)
-        query_string = scope.get("query_string", b"").decode("latin-1")
-        query_params = urllib.parse.parse_qs(query_string)
+        token = _extract_token(Headers(scope=scope))
+        identity: AuthIdentity | None = None
+        if token:
+            from agent_bus.tokens import get_token_store
 
-        token: str | None = None
+            row = get_token_store().lookup(token)
+            if row is not None:
+                # Effective admin = admin AND browser: the flag is only honored
+                # on browser-minted (24h) tokens so a stale Okta group
+                # membership is bounded to 24h (decision). MCP/CLI tokens are
+                # never admin, even if the row says so.
+                browser = bool(row["browser"])
+                identity = AuthIdentity(
+                    iss=row["iss"],
+                    sub=row["sub"],
+                    admin=bool(row["admin"]) and browser,
+                    browser=browser,
+                    token_id=row["id"],
+                )
 
-        # 1. Authorization: Bearer <token>
-        auth_header = headers.get("authorization", "")
-        if auth_header.startswith("Bearer "):
-            token = auth_header[7:].strip()
-        elif auth_header:
-            token = auth_header.strip()
-
-        # 2. X-API-Key: <token>
-        if not token:
-            token = headers.get("x-api-key")
-
-        # 3. Query param: ?token=<token>
-        query_token = query_params.get("token", [None])[0]
-        if not token and query_token:
-            token = query_token
-
-        # 4. Cookie: agent_bus_token=<token>
-        if not token:
-            cookie_header = headers.get("cookie", "")
-            for cookie in cookie_header.split(";"):
-                cookie = cookie.strip()
-                if cookie.startswith("agent_bus_token="):
-                    token = cookie.split("=", 1)[1]
-                    break
-
-        if token != self.secret:
+        if identity is None:
             response = JSONResponse(
-                {"error": "Unauthorized", "detail": "Valid authentication token required"},
+                {
+                    "error": "Unauthorized",
+                    "detail": "A valid Agent Bus token is required.",
+                    "login_url": login_url(),
+                },
                 status_code=401,
                 headers={"WWW-Authenticate": "Bearer"},
             )
             await response(scope, receive, send)
             return
 
-        # If authenticated via query parameter, set cookie on response for browser convenience
-        if query_token and query_token == self.secret:
-
-            async def send_with_cookie(message: dict[str, Any]) -> None:
-                if message["type"] == "http.response.start":
-                    res_headers = list(message.get("headers", []))
-                    cookie_val = (
-                        f"agent_bus_token={self.secret}; Path=/; HttpOnly; SameSite=Lax"
-                    ).encode("latin-1")
-                    res_headers.append((b"set-cookie", cookie_val))
-                    message["headers"] = res_headers
-                await send(message)
-
-            await self.app(scope, receive, send_with_cookie)
-            return
-
+        scope.setdefault("state", {})
+        scope["state"]["auth"] = identity
         await self.app(scope, receive, send)
+
+
+def _extract_token(headers: Headers) -> str | None:
+    auth_header = headers.get("authorization", "")
+    if auth_header.startswith("Bearer "):
+        return auth_header[7:].strip()
+    if auth_header:
+        return auth_header.strip()
+    api_key = headers.get("x-api-key")
+    if api_key:
+        return api_key.strip()
+    return _cookie_token(headers)
+
+
+def identity_from_scope(scope: MutableMapping[str, Any] | None) -> AuthIdentity | None:
+    """Read the authenticated identity from a raw ASGI scope, if present."""
+    if scope is None:
+        return None
+    state = scope.get("state")
+    if not state:
+        return None
+    identity = state.get("auth")
+    return identity if isinstance(identity, AuthIdentity) else None

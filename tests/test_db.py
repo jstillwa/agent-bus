@@ -586,6 +586,9 @@ def test_get_messages_empty_topic(tmp_path):
 
 
 def test_sync_once_touches_cursor_timestamp(monkeypatch, tmp_path):
+    # Contract since the read-only-poll perf change: a FIRST sync (even bare)
+    # persists the cursor row; a sync carrying an outbox advances the
+    # timestamp; bare repeat polls stay read-only and do not re-touch it.
     times = iter([1000.0, 1001.0, 1002.0])
     monkeypatch.setattr(db_mod, "now", lambda: next(times))
 
@@ -601,17 +604,25 @@ def test_sync_once_touches_cursor_timestamp(monkeypatch, tmp_path):
         auto_advance=True,
         ack_through=None,
     )
+    assert cursor1.updated_at == 1001.0
+
     _, _, cursor2, _ = db.sync_once(
         topic_id=t.topic_id,
         agent_name="a",
-        outbox=[],
+        outbox=[
+            {
+                "content_markdown": "ping",
+                "message_type": "message",
+                "reply_to": None,
+                "metadata": None,
+                "client_message_id": None,
+            }
+        ],
         max_items=50,
         include_self=False,
         auto_advance=True,
         ack_through=None,
     )
-
-    assert cursor1.updated_at == 1001.0
     assert cursor2.updated_at == 1002.0
 
 

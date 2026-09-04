@@ -5,12 +5,15 @@ import time
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 import click
 
 from agent_bus.db import AgentBusDB
 from agent_bus.version import __version__
+
+if TYPE_CHECKING:
+    from agent_bus.tokens import TokenStore
 
 
 @click.group()
@@ -784,3 +787,100 @@ def embeddings_index(
         f"Indexed {stats['indexed']} message(s); skipped {stats['skipped']}.",
         err=True,
     )
+
+
+@cli.group("tokens")
+def tokens_group() -> None:
+    """API token operations (Okta-minted or CLI-minted)."""
+
+
+def _token_store() -> TokenStore:
+    from agent_bus.tokens import TokenStore
+
+    return TokenStore()
+
+
+@tokens_group.command("mint")
+@click.option("--sub", required=True, help="Owner identity (Okta sub for Okta users).")
+@click.option(
+    "--iss",
+    default=None,
+    help="Token issuer (defaults to $AGENT_BUS_OKTA_ISSUER or 'cli').",
+)
+@click.option("--email", default=None, help="Owner email (display only).")
+@click.option("--name", default=None, help="Owner display name (display only).")
+@click.option(
+    "--admin",
+    is_flag=True,
+    help="Mint an admin token. Only effective on --browser tokens (24h admin sessions).",
+)
+@click.option(
+    "--browser",
+    is_flag=True,
+    help="Mint a browser token (24h TTL; admin-capable; cookie sessions).",
+)
+def tokens_mint(
+    *, sub: str, iss: str | None, email: str | None, name: str | None, admin: bool, browser: bool
+) -> None:
+    """Mint a token for a user (local-operator trust; shown once).
+
+    Closes the CI/service-account gap: headless agents get their own token
+    instead of running under a human's identity.
+    """
+    import os
+
+    store = _token_store()
+    token_id, raw = store.mint(
+        iss=(iss or os.environ.get("AGENT_BUS_OKTA_ISSUER") or "cli").rstrip("/"),
+        sub=sub,
+        email=email,
+        name=name,
+        admin=admin,
+        browser=browser,
+    )
+    click.echo(f"Token ID: {token_id}")
+    click.echo(f"Token (shown once): {raw}")
+    click.echo(
+        f"Use: Authorization: Bearer {raw}{' (browser token, expires in 24h)' if browser else ''}"
+    )
+    if admin and not browser:
+        click.echo(
+            "Note: --admin is only honored on --browser tokens; this token is a "
+            "regular user token over HTTP.",
+            err=True,
+        )
+
+
+@tokens_group.command("list")
+@click.option("--json", "as_json", is_flag=True, help="Print JSON instead of a table.")
+def tokens_list(*, as_json: bool) -> None:
+    """List tokens (no raw values — they are never stored)."""
+    store = _token_store()
+    rows = store.list_tokens()
+    if as_json:
+        click.echo(json.dumps({"tokens": rows}, indent=2, sort_keys=True, default=str))
+        return
+
+    click.echo(f"Tokens DB: {store.path}")
+    click.echo(f"Tokens: {len(rows)}")
+    for r in rows:
+        state = (
+            "revoked" if r["revoked_at"] else ("expired" if not store.valid(r["id"]) else "valid")
+        )
+        admin = "admin" if r["admin"] else "-"
+        scope = "browser" if r["browser"] else "mcp"
+        click.echo(
+            f"- {r['id']} sub={r['sub']} email={r['email'] or '-'} "
+            f"{admin} {scope} {state} expires={datetime.fromtimestamp(r['expires_at']).isoformat()}"
+        )
+
+
+@tokens_group.command("revoke")
+@click.argument("token_id")
+def tokens_revoke(token_id: str) -> None:
+    """Revoke a token by id (2am/offboarding runbook; works while server is down)."""
+    store = _token_store()
+    if store.revoke(token_id):
+        click.echo(f"Revoked token {token_id}.")
+    else:
+        raise click.ClickException(f"Token not found or already revoked: {token_id}")

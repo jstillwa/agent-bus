@@ -35,6 +35,7 @@ Issues = "https://github.com/alessandrobologna/agent-bus-mcp/issues"
 [project.optional-dependencies]
 web = [
   "fastapi>=0.128.0",
+  "httpx>=0.28",
   "uvicorn>=0.40.0",
 ]
 

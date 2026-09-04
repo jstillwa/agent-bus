@@ -46,6 +46,17 @@ def serve_command(host: str | None, port: int | None, db_path: str | None) -> No
             "Web UI dependencies not installed. Install with: uv sync --extra web"
         ) from None
 
+    from agent_bus.oauth import missing_env
+
+    missing = missing_env()
+    if missing:
+        raise click.ClickException(
+            "Refusing to start an unauthenticated HTTP server. Set: "
+            + ", ".join(missing)
+            + "\n(AGENT_BUS_OKTA_ISSUER/CLIENT_ID/CLIENT_SECRET + AGENT_BUS_PUBLIC_URL). "
+            "See the Okta setup docs. stdio (`agent-bus`) needs no auth."
+        )
+
     bind_host = (
         host
         or os.environ.get("AGENT_BUS_HOST")

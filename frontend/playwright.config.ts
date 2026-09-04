@@ -6,6 +6,11 @@ export default defineConfig({
   use: {
     baseURL: "http://127.0.0.1:4173",
     headless: true,
+    // The serve web server now requires token auth; test:e2e mints a
+    // browser-admin token and exports PLAYWRIGHT_TOKEN before running.
+    ...(process.env.PLAYWRIGHT_TOKEN
+      ? { extraHTTPHeaders: { Authorization: `Bearer ${process.env.PLAYWRIGHT_TOKEN}` } }
+      : {}),
   },
   webServer: {
     command:
