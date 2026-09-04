@@ -2,15 +2,33 @@ from __future__ import annotations
 
 import asyncio
 import signal
+import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import ClassVar
 
 from fastapi.testclient import TestClient
 from starlette.responses import StreamingResponse
 
+import agent_bus.tokens
 from agent_bus import db as db_module
 from agent_bus import search as search_module
+from agent_bus.tokens import TokenStore
 from agent_bus.web import server as web_server
+
+# Module-level admin token: these tests authenticate as an admin (sees everything).
+_STORE = TokenStore(path=Path(tempfile.mkdtemp()) / "tokens.sqlite")
+# Browser token: effective admin requires admin AND browser (24h rule).
+_ADMIN_ID, _ADMIN_RAW = _STORE.mint(
+    iss="https://test.local", sub="web-tests-admin", admin=True, browser=True
+)
+agent_bus.tokens.get_token_store = lambda: _STORE
+AUTH_HEADERS = {"Authorization": f"Bearer {_ADMIN_RAW}"}
+from agent_bus.auth import AuthIdentity  # noqa: E402
+
+ADMIN_IDENTITY = AuthIdentity(
+    iss="https://test.local", sub="web-tests-admin", admin=True, browser=True, token_id=_ADMIN_ID
+)
 
 
 def prepare_static_bundle(tmp_path: Path, monkeypatch) -> None:
@@ -61,7 +79,7 @@ def test_spa_shell_routes_serve_index(tmp_path: Path, monkeypatch) -> None:
     db = web_server.get_db()
     topic = db.topic_create(name="pink", metadata=None, mode="new")
 
-    with TestClient(web_server.app) as client:
+    with TestClient(web_server.app, headers=AUTH_HEADERS) as client:
         root = client.get("/")
         topic_page = client.get(f"/topics/{topic.topic_id}")
 
@@ -80,7 +98,7 @@ def test_api_topics_returns_last_updated_sorting(tmp_path: Path, monkeypatch) ->
     db.topic_create(name="second", metadata=None, mode="new")
     seed_topic_message(db, first.topic_id, "alice", "latest note")
 
-    with TestClient(web_server.app) as client:
+    with TestClient(web_server.app, headers=AUTH_HEADERS) as client:
         res = client.get("/api/topics?sort=last_updated_desc&status=all")
 
     assert res.status_code == 200
@@ -101,7 +119,7 @@ def test_api_topics_last_updated_sort_includes_older_recently_updated_topic(
     newest = db.topic_create(name="newest", metadata=None, mode="new")
     seed_topic_message(db, oldest.topic_id, "alice", "fresh update")
 
-    with TestClient(web_server.app) as client:
+    with TestClient(web_server.app, headers=AUTH_HEADERS) as client:
         res = client.get("/api/topics?sort=last_updated_desc&status=all&limit=2")
 
     assert res.status_code == 200
@@ -120,7 +138,7 @@ def test_api_topic_detail_with_focus_returns_context_window(tmp_path: Path, monk
 
     focused = db.get_latest_messages(topic_id=topic.topic_id, limit=1)[0]
 
-    with TestClient(web_server.app) as client:
+    with TestClient(web_server.app, headers=AUTH_HEADERS) as client:
         res = client.get(f"/api/topics/{topic.topic_id}?focus={focused.message_id}")
 
     assert res.status_code == 200
@@ -160,7 +178,7 @@ def test_api_global_search_returns_json(tmp_path: Path, monkeypatch) -> None:
 
     monkeypatch.setattr(search_module, "search_messages", fake_search_messages)
 
-    with TestClient(web_server.app) as client:
+    with TestClient(web_server.app, headers=AUTH_HEADERS) as client:
         res = client.get("/api/search?q=handoff&mode=semantic")
 
     assert res.status_code == 200
@@ -179,7 +197,7 @@ def test_api_delete_routes_remove_messages_and_topics(tmp_path: Path, monkeypatc
     seed_topic_message(db, topic.topic_id, "alice", "two")
     messages = db.get_messages(topic_id=topic.topic_id, limit=20)
 
-    with TestClient(web_server.app) as client:
+    with TestClient(web_server.app, headers=AUTH_HEADERS) as client:
         delete_messages_res = client.request(
             "DELETE",
             f"/api/topics/{topic.topic_id}/messages",
@@ -201,6 +219,8 @@ def test_api_topics_stream_uses_sse_framing(tmp_path: Path, monkeypatch) -> None
     db.topic_create(name="pink", metadata=None, mode="new")
 
     class FakeRequest:
+        scope: ClassVar[dict] = {"state": {"auth": ADMIN_IDENTITY}}
+
         async def is_disconnected(self) -> bool:
             return False
 
@@ -218,6 +238,8 @@ def test_api_topics_stream_survives_db_busy(tmp_path: Path, monkeypatch) -> None
     web_server.init_db(str(tmp_path / "bus.sqlite"))
 
     class FakeRequest:
+        scope: ClassVar[dict] = {"state": {"auth": ADMIN_IDENTITY}}
+
         async def is_disconnected(self) -> bool:
             return False
 
@@ -276,6 +298,8 @@ def test_api_topic_stream_survives_db_busy(tmp_path: Path, monkeypatch) -> None:
     topic = db.topic_create(name="pink", metadata=None, mode="new")
 
     class FakeRequest:
+        scope: ClassVar[dict] = {"state": {"auth": ADMIN_IDENTITY}}
+
         async def is_disconnected(self) -> bool:
             return False
 
@@ -299,7 +323,7 @@ def test_api_topic_export_uses_iso_timestamps(tmp_path: Path, monkeypatch) -> No
     topic = db.topic_create(name="alpha", metadata=None, mode="new")
     seed_topic_message(db, topic.topic_id, "alice", "hello")
 
-    with TestClient(web_server.app) as client:
+    with TestClient(web_server.app, headers=AUTH_HEADERS) as client:
         res = client.get(f"/api/topics/{topic.topic_id}/export")
 
     assert res.status_code == 200

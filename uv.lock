@@ -15,6 +15,7 @@ dependencies = [
 [package.optional-dependencies]
 web = [
     { name = "fastapi" },
+    { name = "httpx" },
     { name = "uvicorn" },
 ]
 
@@ -31,6 +32,7 @@ dev = [
 requires-dist = [
     { name = "click", specifier = ">=8.3.1" },
     { name = "fastapi", marker = "extra == 'web'", specifier = ">=0.128.0" },
+    { name = "httpx", marker = "extra == 'web'", specifier = ">=0.28" },
     { name = "mcp", specifier = ">=1.25.0,<2.0" },
     { name = "numpy", specifier = ">=2.4.1" },
     { name = "uvicorn", marker = "extra == 'web'", specifier = ">=0.40.0" },

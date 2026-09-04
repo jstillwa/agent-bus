@@ -321,3 +321,72 @@ Output:
 
 - `results`: list of matches (includes `topic_id`, `topic_name`, `message_id`, `seq`, `sender`, `message_type`, `created_at`, `snippet`)
 - If `include_content=true`, each result also includes `content_markdown`.
+
+## 5) HTTP deployment: auth, ownership, admin
+
+The stdio server (sections 0–4) is a single-user local deployment: the operator owns the SQLite
+file, and there is intentionally no authentication. The HTTP deployment (`agent-bus serve`:
+Web UI, browser API, and MCP over Streamable HTTP `/mcp` + legacy SSE `/sse`) is multi-user and
+behaves differently. The protocol is therefore **deployment-mode-dependent**.
+
+### 5.1 Authentication
+
+- Every HTTP request must present a per-user token: `Authorization: Bearer <token>`,
+  `X-API-Key: <token>`, or the `agent_bus_token` cookie (browser sessions). `?token=` query
+  parameters are not accepted (credentials must not leak into logs/history/Referer).
+- Tokens are minted by an OIDC (Okta) login flow: `/auth/login` → provider → `/auth/callback`.
+  `?browser=1` mints a browser cookie token instead of a show-once page.
+- Tokens are opaque (`ab_…`), stored hashed (SHA-256) in a separate SQLite file
+  (`AGENT_BUS_TOKENS_DB`, sibling of `AGENT_BUS_DB`; snapshot both together for backup).
+  MCP tokens live 90 days (`AGENT_BUS_TOKEN_TTL_DAYS`); browser tokens 24 hours.
+- Unauthenticated requests get `401` with `WWW-Authenticate: Bearer` and the login URL.
+  `/health` and `/auth/*` are public.
+- `agent-bus serve` refuses to start without `AGENT_BUS_OKTA_ISSUER`,
+  `AGENT_BUS_OKTA_CLIENT_ID`, `AGENT_BUS_OKTA_CLIENT_SECRET`, and `AGENT_BUS_PUBLIC_URL`.
+  The issuer being *unreachable* degrades only `/auth/*` (503); existing tokens keep working.
+- Standalone unauthenticated HTTP MCP (`agent-bus` with `$PORT`) is refused; HTTP MCP is served
+  only by `agent-bus serve`.
+
+### 5.2 Ownership and visibility
+
+- Topics are owned by their creator: the server stamps `metadata["_owner"] = "<iss>|<sub>"` at
+  `topic_create` time. All `_`-prefixed metadata keys are **server-managed**: clients may not set
+  them, and they are stripped from client-supplied metadata on every write path.
+- For a non-admin caller, topics owned by someone else are **invisible, not forbidden**: reading,
+  joining, resolving, searching, closing, renaming, or deleting a foreign topic returns the same
+  error as a missing one (`TOPIC_NOT_FOUND` / HTTP 404). This avoids a topic-existence oracle and
+  name-squatting: `topic_create(mode="reuse")` and `topic_resolve`/`topic_join` by name resolve
+  **within the caller's own topics only**; a foreign same-named topic never blocks name reuse
+  (topic names are not globally unique).
+- Lists and global search are filtered to the caller's topics. Scoped queries over-fetch past the
+  core's global LIMIT/ranking and filter afterwards (bounded over-fetch). ponytail: upgrade to a
+  core `WHERE owner=?` if scale demands.
+- Topics created via stdio (no `_owner`) are visible only to admins, for cleanup.
+- There is **no cross-user sharing** in this version.
+
+### 5.3 Admin
+
+- A caller is an admin when their token was minted **after a browser login** by a user carrying the
+  group claim `AGENT_BUS_ADMIN_GROUP` (default `Permission - agent-bus - Admin`). The admin flag
+  is only honored on browser tokens (24h TTL), bounding stale group membership to one day;
+  MCP/show-once/CLI tokens are never admin.
+- Admins see and operate on all topics. The `/admin` page (token table + revoke, topic table +
+  delete) and `/api/admin/*` require a browser admin session. Cookie-authenticated mutations must
+  carry a same-origin `Origin` header (CSRF defense).
+- `agent-bus cli tokens mint/list/revoke` manages tokens from the server host (local-operator
+  trust, same as stdio) — the CI/service-account path and the recovery path when Okta is broken.
+
+### 5.4 Guard matrix
+
+| Surface | Non-admin | Admin |
+|---|---|---|
+| MCP `topic_create` (new) | `_owner` stamped; client `_`-keys stripped | same (owner = admin's user) |
+| MCP `topic_create` (reuse) | resolves within owned only; else creates new same-named topic | global newest (unchanged) |
+| MCP `topic_join`, `topic_resolve` (id or name) | owned only; foreign = `TOPIC_NOT_FOUND` | all |
+| MCP `sync`, `cursor_reset`, `topic_presence`, `messages_search`, `topic_close` | owned only; foreign = `TOPIC_NOT_FOUND` | all |
+| MCP `topic_list`, global search | owned only | all |
+| HTTP `/api/topics*` (list/detail/messages/export/search/close/delete) | owned only; 404 on foreign | all |
+| HTTP `/api/search` | filtered to owned | all |
+| HTTP streams | owned only; token re-validated each tick | all |
+| HTTP `/admin`, `/api/admin/*` | 403 | all |
+| stdio (any tool) | local trust: no auth, no scoping | — |

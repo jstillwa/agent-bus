@@ -13,19 +13,21 @@ from pathlib import Path
 from typing import Annotated, Any, Literal, cast
 
 from fastapi import Body, FastAPI, HTTPException, Query, Request
-from pydantic import BaseModel, Field
 from fastapi.responses import (
     FileResponse,
     HTMLResponse,
     PlainTextResponse,
+    RedirectResponse,
     Response,
     StreamingResponse,
 )
+from pydantic import BaseModel, Field
 from starlette.routing import Route
 
-from agent_bus.auth import SharedSecretAuthMiddleware
+from agent_bus.auth import AuthIdentity, TokenAuthMiddleware, identity_from_scope
 from agent_bus.db import AgentBusDB, DBBusyError, TopicNotFoundError
 from agent_bus.models import Cursor, Message
+from agent_bus.ownership import OWNER_KEY, is_visible, owner_key
 
 STATIC_DIR = Path(__file__).parent / "static"
 SPA_INDEX = STATIC_DIR / "index.html"
@@ -68,9 +70,49 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Agent Bus MCP", docs_url=None, redoc_url=None, lifespan=lifespan)
-app.add_middleware(SharedSecretAuthMiddleware)
+app.add_middleware(TokenAuthMiddleware)  # ty: ignore[invalid-argument-type]  # starlette's _MiddlewareFactory ParamSpec protocol; class shape is correct (pre-existing with SharedSecretAuthMiddleware)
 
 _db: AgentBusDB | None = None
+
+
+# --- auth helpers -----------------------------------------------------------
+
+
+def request_auth(request: Request) -> AuthIdentity | None:
+    return identity_from_scope(request.scope)
+
+
+def guard_topic(request: Request, topic_id: str) -> None:
+    """404 when the caller cannot see the topic (foreign = invisible). Admins see all.
+
+    Fails closed: no identity (only reachable if middleware was bypassed) → 404.
+    """
+    auth = request_auth(request)
+    if auth is None:
+        raise HTTPException(status_code=404, detail="Topic not found")
+    if auth.admin:
+        return
+    try:
+        topic = get_db().get_topic(topic_id=topic_id)
+    except TopicNotFoundError:
+        raise HTTPException(status_code=404, detail="Topic not found") from None
+    if not is_visible(auth, topic):
+        raise HTTPException(status_code=404, detail="Topic not found")
+
+
+def row_is_visible(auth: AuthIdentity, row: dict[str, Any]) -> bool:
+    metadata = row.get("metadata") or {}
+    return metadata.get(OWNER_KEY) == owner_key(auth)
+
+
+def token_still_valid(request: Request) -> bool:
+    """Recheck the caller's token (revocation/expiry) for long-lived streams."""
+    auth = request_auth(request)
+    if auth is None:
+        return False
+    from agent_bus.tokens import get_token_store
+
+    return get_token_store().valid(auth.token_id)
 
 
 @app.get("/health")
@@ -78,6 +120,167 @@ async def health() -> dict[str, Any]:
     from agent_bus.version import __version__
 
     return {"status": "ok", "version": __version__}
+
+
+# --- auth: Okta login flow --------------------------------------------------
+
+
+ADMIN_PAGE = Path(__file__).parent / "admin.html"
+
+
+def require_browser_admin(request: Request) -> None:
+    """Admin routes require an admin-group *browser* token (24h cookie session).
+
+    MCP/show-once tokens are never admin: the flag is only honored on
+    browser-minted tokens so a stale Okta group membership is bounded to 24h.
+    """
+    auth = request_auth(request)
+    if auth is None or not auth.admin or not auth.browser:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "Admin access requires a browser session with the admin group claim. "
+                "Log in via /auth/login?browser=1."
+            ),
+        )
+
+
+def check_cookie_csrf(request: Request) -> None:
+    """Origin check for mutations authenticated via cookie (CSRF defense).
+
+    Bearer/API-key requests are CSRF-immune and skip this. Cookie-authed
+    mutations must carry a same-origin Origin header (browsers always send
+    one for cross-origin and most same-origin POSTs).
+    """
+    auth = request_auth(request)
+    if auth is None or not auth.browser:
+        return
+    origin = request.headers.get("origin")
+    if origin is None:
+        raise HTTPException(status_code=403, detail="Missing Origin header")
+    from agent_bus.oauth import public_url
+
+    if origin.rstrip("/") != public_url():
+        raise HTTPException(status_code=403, detail="Cross-origin request rejected")
+
+
+@app.get("/admin", response_class=HTMLResponse)
+async def admin_page(request: Request) -> Response:
+    require_browser_admin(request)
+    if not ADMIN_PAGE.is_file():
+        raise HTTPException(status_code=500, detail="admin.html missing")
+    return FileResponse(ADMIN_PAGE)
+
+
+@app.get("/api/admin/tokens")
+async def api_admin_tokens(request: Request) -> dict[str, Any]:
+    require_browser_admin(request)
+    from agent_bus.tokens import get_token_store
+
+    tokens = [
+        {
+            "id": row["id"],
+            "iss": row["iss"],
+            "sub": row["sub"],
+            "email": row["email"],
+            "name": row["name"],
+            "admin": bool(row["admin"]),
+            "browser": bool(row["browser"]),
+            "created_at": row["created_at"],
+            "expires_at": row["expires_at"],
+            "revoked_at": row["revoked_at"],
+        }
+        for row in get_token_store().list_tokens()  # raw token hashes never leave the server
+    ]
+    return {"tokens": tokens}
+
+
+@app.post("/api/admin/tokens/{token_id}/revoke")
+async def api_admin_revoke(request: Request, token_id: str) -> dict[str, Any]:
+    require_browser_admin(request)
+    check_cookie_csrf(request)
+    from agent_bus.tokens import get_token_store
+
+    revoked = get_token_store().revoke(token_id)
+    auth = request_auth(request)
+    import logging
+
+    logging.getLogger("agent_bus").info(
+        "admin revoke token=%s by=%s", token_id, auth.sub if auth else "?"
+    )
+    if not revoked:
+        raise HTTPException(status_code=404, detail="Token not found or already revoked")
+    return {"status": "ok", "token_id": token_id, "revoked": True}
+
+
+@app.get("/auth/login")
+@app.get("/auth/login")
+async def auth_login(browser: bool = False) -> Response:
+    """Redirect to the Okta authorize URL. `?browser=1` mints a cookie token (admin UI)."""
+    from agent_bus import oauth
+
+    try:
+        url = oauth.start_login(browser=browser)
+    except oauth.OktaUnavailable as e:
+        raise HTTPException(status_code=503, detail=str(e)) from None
+    return RedirectResponse(url)
+
+
+@app.get("/auth/callback")
+async def auth_callback(code: str = "", state: str = "") -> Response:
+    from agent_bus import oauth
+
+    if not code or not state:
+        return HTMLResponse(
+            "<h1>Login failed</h1><p>Missing code/state from the provider.</p>", 400
+        )
+    try:
+        result = oauth.complete_login(code=code, state=state)
+    except oauth.OAuthError as e:
+        return HTMLResponse(f"<h1>Login failed</h1><p>{e}</p>", 400)
+
+    if result.browser:
+        response = RedirectResponse("/admin", status_code=303)
+        response.set_cookie(
+            "agent_bus_token",
+            result.raw_token,
+            max_age=24 * 60 * 60,
+            path="/",
+            httponly=True,
+            samesite="strict",
+            secure=oauth.public_url().startswith("https://"),
+        )
+        return response
+
+    # Show-once page: the raw token is displayed exactly this once.
+    snippet = (
+        '{\n  "mcpServers": {\n    "agent-bus": {\n'
+        f'      "url": "{oauth.public_url()}/mcp",\n'
+        '      "headers": { "Authorization": "Bearer YOUR_TOKEN" }\n'
+        "    }\n  }\n}"
+    )
+    return HTMLResponse(
+        f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Agent Bus token</title>
+<style>body{{font-family:system-ui,sans-serif;max-width:44rem;margin:3rem auto;padding:0 1rem}}
+code{{background:#f1e8da;padding:.15rem .4rem;border-radius:.3rem;word-break:break-all}}
+pre{{background:#211b16;color:#f6f1e9;padding:1rem;border-radius:.5rem;overflow:auto}}</style></head>
+<body>
+<h1>Your Agent Bus token</h1>
+<p>Copy it now — it is never shown again:</p>
+<p><code id="tok">{result.raw_token}</code></p>
+<p><button onclick="navigator.clipboard.writeText(document.getElementById('tok').textContent)">Copy token</button></p>
+<h2>MCP client config</h2>
+<pre>{snippet}</pre>
+<p>Replace <code>YOUR_TOKEN</code> with the token above. Expires in 90 days; log in again to mint a new one.</p>
+</body></html>""",
+        headers={
+            "Cache-Control": "no-store",
+            "Pragma": "no-cache",
+            "Referrer-Policy": "no-referrer",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
 
 
 def setup_mcp_routes() -> None:
@@ -330,19 +533,31 @@ def topic_stream_state(db: AgentBusDB, *, topic_id: str) -> dict[str, Any]:
 
 @app.get("/api/topics")
 async def api_topics(
+    request: Request,
     status: TopicStatusFilter = "all",
     sort: TopicSort = "last_updated_desc",
     q: str = "",
     limit: int = Query(200, ge=1, le=1000),
 ) -> dict[str, Any]:
     db = get_db()
-    topics = list_topic_summaries(db, status=status, sort=sort, query=q, limit=limit)
+    auth = request_auth(request)
+    fetch_limit = limit
+    if auth is not None and not auth.admin:
+        # ponytail: over-fetch + filter (core LIMIT is global); core WHERE owner=? if scale demands
+        fetch_limit = limit * 4
+    rows = db.topic_list_with_counts(status=status, sort=sort, query=q, limit=fetch_limit)
+    if auth is not None and not auth.admin:
+        rows = [row for row in rows if row_is_visible(auth, row)]
+    topics = [normalize_topic_summary(row) for row in rows[:limit]]
     return {"topics": topics}
 
 
 @app.get("/api/topics/{topic_id}")
-async def api_topic_detail(topic_id: str, focus: str | None = None) -> dict[str, Any]:
+async def api_topic_detail(
+    request: Request, topic_id: str, focus: str | None = None
+) -> dict[str, Any]:
     db = get_db()
+    guard_topic(request, topic_id)
     summary = get_topic_summary(db, topic_id=topic_id)
     context_mode = False
     focus_message_id: str | None = None
@@ -385,17 +600,14 @@ async def api_topic_detail(topic_id: str, focus: str | None = None) -> dict[str,
 
 @app.get("/api/topics/{topic_id}/messages")
 async def api_topic_messages(
+    request: Request,
     topic_id: str,
     after_seq: int = Query(0, ge=0),
     before_seq: int | None = Query(None, ge=0),
     limit: int = Query(DEFAULT_PAGE_SIZE, ge=1, le=200),
 ) -> dict[str, Any]:
     db = get_db()
-
-    try:
-        db.get_topic(topic_id=topic_id)
-    except TopicNotFoundError:
-        raise HTTPException(status_code=404, detail="Topic not found") from None
+    guard_topic(request, topic_id)
 
     messages = db.get_messages(
         topic_id=topic_id,
@@ -414,27 +626,32 @@ async def api_topic_messages(
 
 @app.get("/api/search")
 async def api_global_search(
+    request: Request,
     q: str = "",
     mode: SearchMode = "hybrid",
     limit: int = Query(20, ge=1, le=50),
 ) -> dict[str, Any]:
     db = get_db()
-    results, warnings = run_search(db=db, query=q, mode=mode, limit=limit)
+    auth = request_auth(request)
+    fetch_limit = limit * 4 if (auth is not None and not auth.admin) else limit
+    results, warnings = run_search(db=db, query=q, mode=mode, limit=fetch_limit)
+    if auth is not None and not auth.admin:
+        # ponytail: over-fetch + filter; core WHERE owner=? if scale demands
+        owned_ids = {t.topic_id for t in db.topic_list(status="all") if is_visible(auth, t)}
+        results = [r for r in results if r.get("topic_id") in owned_ids][:limit]
     return {"query": q.strip(), "mode": mode, "warnings": warnings, "results": results}
 
 
 @app.get("/api/topics/{topic_id}/search")
 async def api_topic_search(
+    request: Request,
     topic_id: str,
     q: str = "",
     mode: SearchMode = "hybrid",
     limit: int = Query(20, ge=1, le=50),
 ) -> dict[str, Any]:
     db = get_db()
-    try:
-        db.get_topic(topic_id=topic_id)
-    except TopicNotFoundError:
-        raise HTTPException(status_code=404, detail="Topic not found") from None
+    guard_topic(request, topic_id)
 
     results, warnings = run_search(db=db, query=q, mode=mode, limit=limit, topic_id=topic_id)
     return {
@@ -447,8 +664,9 @@ async def api_topic_search(
 
 
 @app.get("/api/topics/{topic_id}/export", response_class=PlainTextResponse)
-async def api_topic_export(topic_id: str) -> PlainTextResponse:
+async def api_topic_export(request: Request, topic_id: str) -> PlainTextResponse:
     db = get_db()
+    guard_topic(request, topic_id)
     try:
         summary = get_topic_summary(db, topic_id=topic_id)
     except TopicNotFoundError:
@@ -488,10 +706,12 @@ async def api_topic_export(topic_id: str) -> PlainTextResponse:
 
 @app.post("/api/topics/{topic_id}/messages")
 async def api_post_message(
+    request: Request,
     topic_id: str,
     payload: PostMessageRequest,
 ) -> dict[str, Any]:
     db = get_db()
+    guard_topic(request, topic_id)
     try:
         topic = db.get_topic(topic_id=topic_id)
     except TopicNotFoundError:
@@ -538,13 +758,15 @@ async def api_post_message(
 
 @app.post("/api/topics/{topic_id}/close")
 async def api_close_topic(
+    request: Request,
     topic_id: str,
     payload: CloseTopicRequest | None = None,
 ) -> dict[str, Any]:
     db = get_db()
+    guard_topic(request, topic_id)
     reason = payload.reason if payload and payload.reason is not None else "closed via web UI"
     try:
-        topic, closed_now = await asyncio.to_thread(
+        _topic, closed_now = await asyncio.to_thread(
             db.topic_close,
             topic_id=topic_id,
             reason=reason,
@@ -563,8 +785,9 @@ async def api_close_topic(
 
 
 @app.delete("/api/topics/{topic_id}")
-async def api_delete_topic(topic_id: str) -> dict[str, Any]:
+async def api_delete_topic(request: Request, topic_id: str) -> dict[str, Any]:
     db = get_db()
+    guard_topic(request, topic_id)
     deleted = db.delete_topic(topic_id=topic_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="Topic not found") from None
@@ -573,14 +796,12 @@ async def api_delete_topic(topic_id: str) -> dict[str, Any]:
 
 @app.delete("/api/topics/{topic_id}/messages")
 async def api_delete_messages(
+    request: Request,
     topic_id: str,
     message_ids: Annotated[list[str], Body(embed=True)],
 ) -> dict[str, Any]:
     db = get_db()
-    try:
-        db.get_topic(topic_id=topic_id)
-    except TopicNotFoundError:
-        raise HTTPException(status_code=404, detail="Topic not found") from None
+    guard_topic(request, topic_id)
 
     deleted_message_ids = db.delete_messages_batch(topic_id=topic_id, message_ids=message_ids)
     return {
@@ -600,6 +821,8 @@ async def api_topics_stream(request: Request) -> StreamingResponse:
         try:
             while True:
                 if await request.is_disconnected():
+                    return
+                if not token_still_valid(request):
                     return
 
                 try:
@@ -631,6 +854,7 @@ async def api_topics_stream(request: Request) -> StreamingResponse:
 @app.get("/api/stream/topics/{topic_id}")
 async def api_topic_stream(topic_id: str, request: Request) -> StreamingResponse:
     db = get_db()
+    guard_topic(request, topic_id)
 
     async def event_stream():
         previous_state: dict[str, Any] | None = None
@@ -638,6 +862,8 @@ async def api_topic_stream(topic_id: str, request: Request) -> StreamingResponse
         try:
             while True:
                 if await request.is_disconnected():
+                    return
+                if not token_still_valid(request):
                     return
 
                 try:
