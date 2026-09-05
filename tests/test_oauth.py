@@ -253,6 +253,28 @@ def test_callback_show_once_page(env, fresh, store, monkeypatch) -> None:
     assert "mcpServers" in text
 
 
+def test_callback_show_once_links_admin_for_group_members(env, fresh, store, monkeypatch) -> None:
+    mock_client(monkeypatch, userinfo={"sub": "admin-1", "groups": [oauth.DEFAULT_ADMIN_GROUP]})
+    from agent_bus.web import server as web_server
+
+    with TestClient(web_server.app) as client:
+        login = client.get("/auth/login", follow_redirects=False)
+        state = login.headers["location"].split("state=")[1].split("&")[0]
+        res = client.get(f"/auth/callback?code=c&state={state}")
+
+    assert res.status_code == 200
+    assert "/auth/login?browser=1" in res.text  # admin link for group members
+
+    # A non-member login shows no admin link.
+    mock_client(monkeypatch, userinfo={"sub": "user-1", "groups": []})
+    with TestClient(web_server.app) as client:
+        login = client.get("/auth/login", follow_redirects=False)
+        state = login.headers["location"].split("state=")[1].split("&")[0]
+        res = client.get(f"/auth/callback?code=c&state={state}")
+    assert res.status_code == 200
+    assert "/admin" not in res.text
+
+
 def test_callback_browser_sets_cookie(env, fresh, store, monkeypatch) -> None:
     mock_client(monkeypatch, userinfo={"sub": "admin-1", "groups": [oauth.DEFAULT_ADMIN_GROUP]})
     from agent_bus.web import server as web_server

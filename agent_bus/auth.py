@@ -22,9 +22,15 @@ from typing import Any
 from starlette.datastructures import Headers
 from starlette.responses import JSONResponse
 
-# Paths reachable without a token: healthchecks and the login flow itself.
+# Paths reachable without a token: healthchecks, the login flow, and the admin
+# page itself (which redirects browsers to the login flow; its data endpoints
+# /api/admin/* stay token-gated).
 PUBLIC_PATHS = ("/health",)
 PUBLIC_PREFIXES = ("/auth/",)
+# Authenticated-optional paths: identity is attached when a valid token is
+# present, but no 401 is raised otherwise (the route redirects browsers to
+# the login flow itself).
+OPTIONAL_PATHS = ("/admin",)
 
 COOKIE_NAME = "agent_bus_token"
 
@@ -91,7 +97,7 @@ class TokenAuthMiddleware:
                     token_id=row["id"],
                 )
 
-        if identity is None:
+        if identity is None and path not in OPTIONAL_PATHS:
             response = JSONResponse(
                 {
                     "error": "Unauthorized",

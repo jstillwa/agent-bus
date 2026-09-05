@@ -166,7 +166,24 @@ def check_cookie_csrf(request: Request) -> None:
 
 @app.get("/admin", response_class=HTMLResponse)
 async def admin_page(request: Request) -> Response:
-    require_browser_admin(request)
+    """Admin page. No token -> redirect to the browser login; token without the
+    admin group (or not a browser session) -> HTML 403. Data endpoints in
+    /api/admin/* remain token-gated regardless."""
+    auth = request_auth(request)
+    if auth is None:
+        return RedirectResponse("/auth/login?browser=1")
+    if not (auth.admin and auth.browser):
+        return HTMLResponse(
+            """<!doctype html><html lang="en"><head><meta charset="utf-8">
+<title>Agent Bus — Admin</title></head>
+<body style="font-family:system-ui;max-width:36rem;margin:4rem auto;padding:0 1rem">
+<h1>403 — not an admin session</h1>
+<p>This page needs a browser login (24h session) by an account in the
+<code>Permission - agent-bus - Admin</code> Okta group. MCP tokens are never admin.</p>
+<p><a href="/auth/login?browser=1">Log in again</a></p>
+</body></html>""",
+            status_code=403,
+        )
     if not ADMIN_PAGE.is_file():
         raise HTTPException(status_code=500, detail="admin.html missing")
     return FileResponse(ADMIN_PAGE)
@@ -259,6 +276,16 @@ async def auth_callback(code: str = "", state: str = "") -> Response:
         '      "headers": { "Authorization": "Bearer YOUR_TOKEN" }\n'
         "    }\n  }\n}"
     )
+    # Group members: point them at the browser admin login (MCP tokens are
+    # never admin — the admin flag is only honored on browser sessions).
+    admin_link = (
+        "<h2>Admin</h2>"
+        "<p>Your account is in the admin group. "
+        '<a href="/auth/login?browser=1">Open the admin interface</a> '
+        "(logs in again and mints a 24h admin browser session).</p>"
+        if result.admin
+        else ""
+    )
     return HTMLResponse(
         f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><title>Agent Bus token</title>
@@ -273,6 +300,7 @@ pre{{background:#211b16;color:#f6f1e9;padding:1rem;border-radius:.5rem;overflow:
 <h2>MCP client config</h2>
 <pre>{snippet}</pre>
 <p>Replace <code>YOUR_TOKEN</code> with the token above. Expires in 90 days; log in again to mint a new one.</p>
+{admin_link}
 </body></html>""",
         headers={
             "Cache-Control": "no-store",
