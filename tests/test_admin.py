@@ -36,6 +36,11 @@ def test_admin_page_requires_browser_admin(store, env) -> None:
     cookie = browser_admin_cookie(store)
 
     with TestClient(web_server.app) as client:
+        # no token at all: browsers are redirected to the admin login flow
+        res = client.get("/admin", follow_redirects=False)
+        assert res.status_code in (302, 307)
+        assert res.headers["location"] == "/auth/login?browser=1"
+
         assert client.get("/admin", cookies={"agent_bus_token": cookie}).status_code == 200
         assert "admin" in client.get("/admin", cookies={"agent_bus_token": cookie}).text.lower()
         # admin group but MCP-minted -> forbidden
@@ -43,6 +48,16 @@ def test_admin_page_requires_browser_admin(store, env) -> None:
         assert res.status_code == 403
         # browser session without admin group -> forbidden
         assert client.get("/admin", cookies={"agent_bus_token": browser_pleb}).status_code == 403
+
+
+def test_api_admin_still_requires_token(store, env) -> None:
+    # /admin the page became public (redirects), but data endpoints stay gated:
+    # no token -> 401 from the middleware, not a redirect.
+    from fastapi.testclient import TestClient
+
+    with TestClient(web_server.app) as client:
+        res = client.get("/api/admin/tokens")
+        assert res.status_code == 401
 
 
 def test_admin_tokens_list_has_no_hashes(store, env) -> None:
