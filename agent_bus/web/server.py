@@ -244,9 +244,28 @@ async def auth_login(browser: bool = False) -> Response:
 
 
 @app.get("/auth/callback")
-async def auth_callback(code: str = "", state: str = "") -> Response:
+async def auth_callback(
+    code: str = "",
+    state: str = "",
+    error: str = "",
+    error_description: str = "",
+) -> Response:
     from agent_bus import oauth
 
+    if error:
+        return HTMLResponse(
+            f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
+<title>Agent Bus — Login failed</title></head>
+<body style="font-family:system-ui;max-width:36rem;margin:4rem auto;padding:0 1rem">
+<h1>Login failed</h1>
+<p>Okta returned <code>{error}</code></p>
+<p>{error_description}</p>
+<p>Common cause: the Okta account is not assigned to the agent-bus application —
+an Okta admin must add the user (or group) to the app.</p>
+<p><a href="/auth/login">Try again</a></p>
+</body></html>""",
+            status_code=400,
+        )
     if not code or not state:
         return HTMLResponse(
             "<h1>Login failed</h1><p>Missing code/state from the provider.</p>", 400
@@ -264,7 +283,12 @@ async def auth_callback(code: str = "", state: str = "") -> Response:
             max_age=24 * 60 * 60,
             path="/",
             httponly=True,
-            samesite="strict",
+            # Lax, not Strict: the callback -> /admin hop is part of a chain
+            # initiated on okta.com; Strict cookies are not sent on that hop,
+            # which loops login -> mint -> redirect forever (one token per
+            # round-trip). CSRF stays covered by the Origin check on
+            # cookie-authenticated mutations (check_cookie_csrf).
+            samesite="lax",
             secure=oauth.public_url().startswith("https://"),
         )
         return response

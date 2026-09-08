@@ -275,6 +275,20 @@ def test_callback_show_once_links_admin_for_group_members(env, fresh, store, mon
     assert "/admin" not in res.text
 
 
+def test_callback_oauth_error_renders_reason(env, fresh, store, monkeypatch) -> None:
+    from agent_bus.web import server as web_server
+
+    with TestClient(web_server.app) as client:
+        res = client.get(
+            "/auth/callback?error=access_denied"
+            "&error_description=User%20is%20not%20assigned%20to%20the%20client%20application."
+        )
+
+    assert res.status_code == 400
+    assert "access_denied" in res.text
+    assert "not assigned to the agent-bus application" in res.text
+
+
 def test_callback_browser_sets_cookie(env, fresh, store, monkeypatch) -> None:
     mock_client(monkeypatch, userinfo={"sub": "admin-1", "groups": [oauth.DEFAULT_ADMIN_GROUP]})
     from agent_bus.web import server as web_server
@@ -288,7 +302,10 @@ def test_callback_browser_sets_cookie(env, fresh, store, monkeypatch) -> None:
     assert res.headers["location"] == "/admin"
     set_cookie = res.headers["set-cookie"]
     assert "HttpOnly" in set_cookie
-    assert "SameSite=strict" in set_cookie
+    # Lax, not Strict: the post-callback redirect chain originates on the
+    # provider's domain; Strict cookies would not be sent on the /admin hop,
+    # looping the login flow (a minted token per round-trip).
+    assert "SameSite=lax" in set_cookie
     cookie_value = set_cookie.split("agent_bus_token=")[1].split(";")[0]
     row = store.lookup(cookie_value)
     assert row is not None and row["admin"] == 1 and row["browser"] == 1
