@@ -275,6 +275,27 @@ def test_callback_show_once_links_admin_for_group_members(env, fresh, store, mon
     assert "/admin" not in res.text
 
 
+def test_logout_revokes_browser_session(env, fresh, store, monkeypatch) -> None:
+    mock_client(monkeypatch, userinfo={"sub": "pleb-1", "groups": []})
+    from agent_bus.web import server as web_server
+
+    with TestClient(web_server.app) as client:
+        login = client.get("/auth/login?browser=1", follow_redirects=False)
+        state = login.headers["location"].split("state=")[1].split("&")[0]
+        callback = client.get(f"/auth/callback?code=c&state={state}", follow_redirects=False)
+        cookie_value = callback.headers["set-cookie"].split("agent_bus_token=")[1].split(";")[0]
+
+        res = client.get("/auth/logout", follow_redirects=False)
+
+        assert res.status_code == 303
+        assert res.headers["location"] == "/"
+        # session token revoked server-side, cookie cleared client-side
+        assert store.lookup(cookie_value) is None
+        assert "max-age=0" in res.headers["set-cookie"].replace(" ", "").lower()
+        # SPA root now bounces the (cookie-less) browser back to login
+        assert client.get("/", follow_redirects=False).status_code in (302, 307)
+
+
 def test_callback_oauth_error_renders_reason(env, fresh, store, monkeypatch) -> None:
     from agent_bus.web import server as web_server
 

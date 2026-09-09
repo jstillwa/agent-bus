@@ -12,6 +12,7 @@ import {
   CheckIcon,
   FolderSearch2Icon,
   ListFilterIcon,
+  LogOutIcon,
   MessageSquareMoreIcon,
   SendIcon,
   Trash2Icon,
@@ -1813,9 +1814,18 @@ function AppSidebar(props: {
           </SidebarGroup>
         </SidebarContent>
         <SidebarFooter className="shrink-0 border-t border-sidebar-border px-4 py-3 pb-4 text-[11px] text-muted-foreground">
-          <>
-            Search the bus with <kbd className="rounded-sm bg-sidebar-accent px-1.5 py-0.5">⌘K</kbd>
-          </>
+          <div className="flex items-center justify-between gap-2">
+            <span className="min-w-0">
+              Search the bus with <kbd className="rounded-sm bg-sidebar-accent px-1.5 py-0.5">⌘K</kbd>
+            </span>
+            <a
+              href="/auth/logout"
+              className="flex shrink-0 items-center gap-1.5 rounded-sm px-2 py-1 hover:bg-sidebar-accent hover:text-sidebar-accent-foreground"
+            >
+              <LogOutIcon className="size-3.5" />
+              Log out
+            </a>
+          </div>
         </SidebarFooter>
       </div>
     </Sidebar>
