@@ -27,10 +27,12 @@ from starlette.responses import JSONResponse
 # /api/admin/* stay token-gated).
 PUBLIC_PATHS = ("/health",)
 PUBLIC_PREFIXES = ("/auth/",)
-# Authenticated-optional paths: identity is attached when a valid token is
-# present, but no 401 is raised otherwise (the route redirects browsers to
-# the login flow itself).
-OPTIONAL_PATHS = ("/admin",)
+# Token-gated paths: data APIs and MCP transports. Everything else (the SPA
+# shell, static assets, /admin) serves no data unauthenticated; those routes
+# attach the identity when a token is present and otherwise redirect browsers
+# to the login flow themselves.
+GATED_PATHS = ("/mcp",)
+GATED_PREFIXES = ("/api/", "/sse", "/messages/")
 
 COOKIE_NAME = "agent_bus_token"
 
@@ -97,7 +99,7 @@ class TokenAuthMiddleware:
                     token_id=row["id"],
                 )
 
-        if identity is None and path not in OPTIONAL_PATHS:
+        if identity is None and (path in GATED_PATHS or path.startswith(GATED_PREFIXES)):
             response = JSONResponse(
                 {
                     "error": "Unauthorized",

@@ -231,7 +231,6 @@ async def api_admin_revoke(request: Request, token_id: str) -> dict[str, Any]:
 
 
 @app.get("/auth/login")
-@app.get("/auth/login")
 async def auth_login(browser: bool = False) -> Response:
     """Redirect to the Okta authorize URL. `?browser=1` mints a cookie token (admin UI)."""
     from agent_bus import oauth
@@ -276,7 +275,7 @@ an Okta admin must add the user (or group) to the app.</p>
         return HTMLResponse(f"<h1>Login failed</h1><p>{e}</p>", 400)
 
     if result.browser:
-        response = RedirectResponse("/admin", status_code=303)
+        response = RedirectResponse("/admin" if result.admin else "/", status_code=303)
         response.set_cookie(
             "agent_bus_token",
             result.raw_token,
@@ -324,6 +323,9 @@ pre{{background:#211b16;color:#f6f1e9;padding:1rem;border-radius:.5rem;overflow:
 <h2>MCP client config</h2>
 <pre>{snippet}</pre>
 <p>Replace <code>YOUR_TOKEN</code> with the token above. Expires in 90 days; log in again to mint a new one.</p>
+<h2>Web UI</h2>
+<p><a href="/auth/login?browser=1">Open the Web UI</a> — logs in again and mints
+a 24h browser session for the topic workbench.</p>
 {admin_link}
 </body></html>""",
         headers={
@@ -458,7 +460,11 @@ def format_missing_bundle_response() -> Response:
     )
 
 
-def spa_index_response() -> Response:
+def spa_index_response(request: Request) -> Response:
+    if request_auth(request) is None:
+        # Browsers with no session land on the login flow; the callback then
+        # mints the cookie the SPA's API calls need.
+        return RedirectResponse("/auth/login?browser=1")
     if not SPA_INDEX.exists():
         return format_missing_bundle_response()
     return FileResponse(SPA_INDEX)
@@ -948,20 +954,20 @@ async def api_topic_stream(topic_id: str, request: Request) -> StreamingResponse
 
 
 @app.get("/", response_class=HTMLResponse)
-async def spa_root() -> Response:
-    return spa_index_response()
+async def spa_root(request: Request) -> Response:
+    return spa_index_response(request)
 
 
 @app.get("/topics/{topic_id}", response_class=HTMLResponse)
-async def spa_topic_page(topic_id: str) -> Response:
+async def spa_topic_page(request: Request, topic_id: str) -> Response:
     _ = topic_id
-    return spa_index_response()
+    return spa_index_response(request)
 
 
 @app.get("/{path:path}")
-async def spa_assets(path: str) -> Response:
+async def spa_assets(request: Request, path: str) -> Response:
     if not path:
-        return spa_index_response()
+        return spa_index_response(request)
 
     candidate = (STATIC_DIR / path).resolve()
     try:
@@ -975,7 +981,7 @@ async def spa_assets(path: str) -> Response:
     if "." in Path(path).name:
         raise HTTPException(status_code=404, detail="Not found") from None
 
-    return spa_index_response()
+    return spa_index_response(request)
 
 
 def run_server(host: str = "127.0.0.1", port: int = 8080, db_path: str | None = None) -> None:
