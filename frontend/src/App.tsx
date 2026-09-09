@@ -1,4 +1,4 @@
-import { startTransition, useEffect, useEffectEvent, useMemo, useRef, useState, type CSSProperties } from "react"
+import { startTransition, useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from "react"
 import ReactMarkdown, { type Components } from "react-markdown"
 import { useLocation, useNavigate } from "react-router-dom"
 import remarkGfm from "remark-gfm"
@@ -546,6 +546,10 @@ function MessageMarkdown(props: { content: string; highlight: MessageHighlightSp
     return () => {
       clearMessageHighlights(container)
     }
+    // highlight is fully captured by highlightTermsKey (MessageHighlightSpec
+    // is {terms} only); depending on object identity would re-walk the DOM
+    // for every message on every render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [content, highlightTermsKey])
 
   return (
@@ -1015,16 +1019,16 @@ function TopicView(props: {
     return () => mediaQuery.removeEventListener("change", updateDesktopState)
   }, [])
 
-  const clearThreadMapHideTimer = useEffectEvent(() => {
+  const clearThreadMapHideTimer = useCallback(() => {
     if (threadMapHideTimerRef.current !== null) {
       window.clearTimeout(threadMapHideTimerRef.current)
       threadMapHideTimerRef.current = null
     }
     threadMapHideAtRef.current = 0
     threadMapHideTimerDueAtRef.current = 0
-  })
+  }, [])
 
-  const scheduleThreadMapHide = useEffectEvent((delay = THREAD_MAP_AUTO_HIDE_MS) => {
+  const scheduleThreadMapHide = useCallback((delay = THREAD_MAP_AUTO_HIDE_MS) => {
     if (typeof window === "undefined") {
       return
     }
@@ -1057,16 +1061,19 @@ function TopicView(props: {
     }
 
     armTimer(delay)
-  })
+  }, [])
 
-  const revealThreadMap = useEffectEvent((delay = THREAD_MAP_AUTO_HIDE_MS) => {
-    if (typeof window === "undefined" || !isDesktopThreadMap || !threadMapQualifies) {
-      return
-    }
+  const revealThreadMap = useCallback(
+    (delay = THREAD_MAP_AUTO_HIDE_MS) => {
+      if (typeof window === "undefined" || !isDesktopThreadMap || !threadMapQualifies) {
+        return
+      }
 
-    setThreadMapVisible(true)
-    scheduleThreadMapHide(delay)
-  })
+      setThreadMapVisible(true)
+      scheduleThreadMapHide(delay)
+    },
+    [isDesktopThreadMap, scheduleThreadMapHide, threadMapQualifies],
+  )
 
   useEffect(() => {
     if (!isDesktopThreadMap || !threadMapQualifies) {
@@ -1184,7 +1191,7 @@ function TopicView(props: {
         window.removeEventListener("resize", measureMarkers)
       }
     }
-  }, [isDesktopThreadMap, topicDetail.messages])
+  }, [isDesktopThreadMap, revealThreadMap, topicDetail.messages])
 
   function jumpToMessage(messageId: string) {
     revealThreadMap()
@@ -2046,6 +2053,28 @@ export default function App() {
     workbenchState.sidebarStatus,
   ])
 
+  // useCallback: the SSE subscription effect below closes over this and
+  // must not re-subscribe when unrelated state changes. Reads `current`
+  // inside the updater — render-scope workbenchState goes stale while the
+  // stream is open.
+  const closeTopic = useCallback((topicId: string) => {
+    setWorkbenchState((current) => {
+      const remaining = current.openTopicIds.filter((value) => value !== topicId)
+      const nextActive =
+        current.activeTopicId === topicId
+          ? (remaining.at(-1) ?? null)
+          : current.activeTopicId
+
+      if (current.activeTopicId === topicId) {
+        startTransition(() =>
+          navigate(nextActive ? `/topics/${encodeURIComponent(nextActive)}` : "/", { replace: true })
+        )
+      }
+
+      return { ...current, openTopicIds: remaining, activeTopicId: nextActive }
+    })
+  }, [navigate])
+
   useEffect(() => {
     if (!routeTopicId) {
       return
@@ -2191,7 +2220,7 @@ export default function App() {
       stream.removeEventListener("topic.deleted", handleDeleted)
       stream.close()
     }
-  }, [routeTopicId])
+  }, [closeTopic, routeTopicId])
 
   const topicMessages = topicDetail?.messages ?? EMPTY_TOPIC_MESSAGES
 
@@ -2284,24 +2313,6 @@ export default function App() {
         replace: options?.replace ?? false,
       })
     )
-  }
-
-  function closeTopic(topicId: string) {
-    const remaining = workbenchState.openTopicIds.filter((value) => value !== topicId)
-    const nextActive =
-      workbenchState.activeTopicId === topicId
-        ? (remaining.at(-1) ?? null)
-        : workbenchState.activeTopicId
-
-    setWorkbenchState((current) => ({
-      ...current,
-      openTopicIds: remaining,
-      activeTopicId: nextActive,
-    }))
-
-    if (workbenchState.activeTopicId === topicId) {
-      startTransition(() => navigate(nextActive ? `/topics/${encodeURIComponent(nextActive)}` : "/", { replace: true }))
-    }
   }
 
   async function loadEarlierMessages() {
