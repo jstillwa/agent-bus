@@ -25,7 +25,12 @@ def make_app() -> tuple[Starlette, dict]:
         return JSONResponse({"status": "ok"})
 
     app = Starlette(
-        routes=[Route("/me", me), Route("/health", health), Route("/auth/login", me)],
+        routes=[
+            Route("/api/me", me),
+            Route("/health", health),
+            Route("/spa", me),
+            Route("/auth/login", me),
+        ],
     )
     app.add_middleware(TokenAuthMiddleware)
     return app, captured
@@ -51,40 +56,47 @@ def minted(store: TokenStore, **kwargs) -> tuple[str, str]:
 
 def test_bearer_token_passes(client: TestClient, store: TokenStore) -> None:
     _, raw = minted(store)
-    res = client.get("/me", headers={"Authorization": f"Bearer {raw}"})
+    res = client.get("/api/me", headers={"Authorization": f"Bearer {raw}"})
     assert res.status_code == 200
     assert res.json()["auth"] is True
 
 
 def test_api_key_header_passes(client: TestClient, store: TokenStore) -> None:
     _, raw = minted(store)
-    res = client.get("/me", headers={"X-API-Key": raw})
+    res = client.get("/api/me", headers={"X-API-Key": raw})
     assert res.status_code == 200
 
 
 def test_cookie_passes(client: TestClient, store: TokenStore) -> None:
     _, raw = minted(store)
-    res = client.get("/me", cookies={"agent_bus_token": raw})
+    res = client.get("/api/me", cookies={"agent_bus_token": raw})
     assert res.status_code == 200
 
 
 def test_query_param_token_rejected(client: TestClient, store: TokenStore) -> None:
     _, raw = minted(store)
-    res = client.get("/me", params={"token": raw})
+    res = client.get("/api/me", params={"token": raw})
     assert res.status_code == 401
 
 
 def test_missing_token_401(client: TestClient) -> None:
-    res = client.get("/me")
+    res = client.get("/api/me")
     assert res.status_code == 401
     assert res.headers["www-authenticate"] == "Bearer"
     assert "login_url" in res.json()
 
 
+def test_spa_paths_pass_through_without_token(client: TestClient) -> None:
+    # SPA shell/assets carry no data: no token needed, no identity attached.
+    res = client.get("/spa")
+    assert res.status_code == 200
+    assert res.json()["auth"] is False
+
+
 def test_revoked_token_401(client: TestClient, store: TokenStore) -> None:
     token_id, raw = minted(store)
     store.revoke(token_id)
-    res = client.get("/me", headers={"Authorization": f"Bearer {raw}"})
+    res = client.get("/api/me", headers={"Authorization": f"Bearer {raw}"})
     assert res.status_code == 401
 
 
@@ -99,7 +111,7 @@ def test_identity_in_state(client: TestClient, store: TokenStore, monkeypatch) -
     monkeypatch.setattr("agent_bus.tokens.get_token_store", lambda: store)
     test_client = TestClient(app)
     _, raw = minted(store, admin=True, browser=True)
-    res = test_client.get("/me", headers={"Authorization": f"Bearer {raw}"})
+    res = test_client.get("/api/me", headers={"Authorization": f"Bearer {raw}"})
     assert res.status_code == 200
     identity = captured["state"]["auth"]
     assert isinstance(identity, AuthIdentity)

@@ -309,3 +309,17 @@ def test_callback_browser_sets_cookie(env, fresh, store, monkeypatch) -> None:
     cookie_value = set_cookie.split("agent_bus_token=")[1].split(";")[0]
     row = store.lookup(cookie_value)
     assert row is not None and row["admin"] == 1 and row["browser"] == 1
+
+
+def test_callback_browser_non_admin_lands_on_spa(env, fresh, store, monkeypatch) -> None:
+    mock_client(monkeypatch, userinfo={"sub": "pleb-1", "groups": []})
+    from agent_bus.web import server as web_server
+
+    with TestClient(web_server.app) as client:
+        login = client.get("/auth/login?browser=1", follow_redirects=False)
+        state = login.headers["location"].split("state=")[1].split("&")[0]
+        res = client.get(f"/auth/callback?code=c&state={state}", follow_redirects=False)
+
+    assert res.status_code == 303
+    # Non-admins get a working browser session for the SPA, not a 403 on /admin.
+    assert res.headers["location"] == "/"
