@@ -25,12 +25,10 @@ from starlette.responses import JSONResponse
 # Paths reachable without a token: healthchecks, the login flow, and the admin
 # page itself (which redirects browsers to the login flow; its data endpoints
 # /api/admin/* stay token-gated).
-PUBLIC_PATHS = ("/health",)
-PUBLIC_PREFIXES = ("/auth/",)
 # Token-gated paths: data APIs and MCP transports. Everything else (the SPA
-# shell, static assets, /admin) serves no data unauthenticated; those routes
-# attach the identity when a token is present and otherwise redirect browsers
-# to the login flow themselves.
+# shell, static assets, /admin, the auth flow) serves no data unauthenticated;
+# those routes see the identity when a token is present and otherwise redirect
+# browsers to the login flow themselves.
 GATED_PATHS = ("/mcp",)
 GATED_PREFIXES = ("/api/", "/sse", "/messages/")
 
@@ -75,10 +73,6 @@ class TokenAuthMiddleware:
             return
 
         path = scope.get("path", "")
-        if path in PUBLIC_PATHS or path.startswith(PUBLIC_PREFIXES):
-            await self.app(scope, receive, send)
-            return
-
         token = _extract_token(Headers(scope=scope))
         identity: AuthIdentity | None = None
         if token:

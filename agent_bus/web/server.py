@@ -242,6 +242,19 @@ async def auth_login(browser: bool = False) -> Response:
     return RedirectResponse(url)
 
 
+@app.get("/auth/logout")
+async def auth_logout(request: Request) -> Response:
+    """Revoke the browser session (if any), clear the cookie, bounce to login."""
+    auth = request_auth(request)
+    if auth is not None and auth.browser:
+        from agent_bus.tokens import get_token_store
+
+        get_token_store().revoke(auth.token_id)
+    response = RedirectResponse("/", status_code=303)
+    response.delete_cookie("agent_bus_token", path="/")
+    return response
+
+
 @app.get("/auth/callback")
 async def auth_callback(
     code: str = "",
