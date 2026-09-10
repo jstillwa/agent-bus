@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.5.2] - 2026-09-10
+
+### Added
+
+- Added chaired topics and chair moderation primitives: `topic_update`, `chair_mute`, and `chair_unmute`.
+- Added binding Robert's Rules polls (`majority`, `two-thirds`, `plurality`): `poll_open`, `poll_vote`, `poll_close`, and `poll_status`.
+- Added automatic in-place database migration from schema version 6 to 7 (`polls` and `poll_votes` tables).
+- Added hard mute enforcement in `sync_once`: muted peers cannot send outbox messages, but can still read incoming messages.
+- Atomic server-written tally and verdict message into topic history upon poll closure.
+
 ## [0.5.1] - 2026-08-15
 
 ### Fixed

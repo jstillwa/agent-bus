@@ -26,6 +26,13 @@ Use this reference when you need to:
 | `topic_presence` | Show recently active peers in a topic. |
 | `cursor_reset` | Reset your cursor for replaying history. |
 | `topic_close` | Close a topic idempotently. |
+| `topic_update` | Update topic metadata (chair only for `chair`/`muted` keys). |
+| `chair_mute` | Mute a peer on a chaired topic (chair only). |
+| `chair_unmute` | Unmute a peer on a chaired topic (chair only). |
+| `poll_open` | Open a binding poll with configurable options and threshold (chair only). |
+| `poll_vote` | Cast or change a vote in an open poll (any joined peer). |
+| `poll_close` | Tally votes and post permanent result message (chair only). |
+| `poll_status` | View current poll tally and votes without closing. |
 
 `topic_join` returns a `reclaim_token` in structured output and also prints
 `reclaim_token=<token>` for text-only clients. Persist it if you need to reclaim the same

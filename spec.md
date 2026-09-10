@@ -62,7 +62,7 @@ Rules:
 
 The DB must include a `meta` table with:
 
-- `schema_version`: `"6"`
+- `schema_version`: `"7"`
 
 If the DB has a missing/mismatched schema version, tools must fail with `DB_SCHEMA_MISMATCH` and instruct the user to wipe the DB.
 
@@ -154,6 +154,41 @@ Constraints:
 
 - Primary key: `(topic_id, agent_name)`
 
+#### `polls`
+
+Binding polls created by the topic chair.
+
+| column | type | notes |
+|---|---|---|
+| poll_id | TEXT PK | short UUID |
+| topic_id | TEXT | |
+| question | TEXT | poll question |
+| options_json | TEXT | JSON array of options |
+| threshold | TEXT | `majority`, `two-thirds`, or `plurality` |
+| status | TEXT | `open`, `closed`, or `superseded` |
+| created_by | TEXT | chair agent name |
+| created_at | REAL | unix seconds |
+| closed_at | REAL NULL | unix seconds |
+
+Indexes:
+
+- `idx_polls_topic_status` on `(topic_id, status)`
+
+#### `poll_votes`
+
+One-per-peer changeable ballots cast in open polls.
+
+| column | type | notes |
+|---|---|---|
+| poll_id | TEXT | |
+| agent_name | TEXT | |
+| choice | TEXT | option string |
+| updated_at | REAL | unix seconds |
+
+Constraints:
+
+- Primary key: `(poll_id, agent_name)`
+
 ## 4) MCP server behavior
 
 ### 4.1 Error codes
@@ -165,6 +200,10 @@ Constraints:
 - db busy/locked -> `DB_BUSY`
 - db schema mismatch -> `DB_SCHEMA_MISMATCH`
 - not joined to topic -> `AGENT_NOT_JOINED`
+- muted on chaired topic -> `MUTED`
+- caller is not topic chair -> `NOT_CHAIR`
+- poll not found -> `POLL_NOT_FOUND`
+- poll closed or superseded -> `POLL_CLOSED`
 
 ### 4.2 Tool list
 
@@ -178,6 +217,13 @@ Constraints:
 - `cursor_reset`
 - `messages_search`
 - `sync`
+- `topic_update`
+- `chair_mute`
+- `chair_unmute`
+- `poll_open`
+- `poll_vote`
+- `poll_close`
+- `poll_status`
 
 `ping` should return:
 
@@ -321,6 +367,37 @@ Output:
 
 - `results`: list of matches (includes `topic_id`, `topic_name`, `message_id`, `seq`, `sender`, `message_type`, `created_at`, `snippet`)
 - If `include_content=true`, each result also includes `content_markdown`.
+
+### 4.8 Chaired topics and moderation semantics
+
+Topics opt in to chair moderation at creation via `metadata`:
+
+```json
+{
+  "chair": "pi-chair-claude"
+}
+```
+
+- Topics without a `"chair"` key are unchaired: moderation tools reject with `INVALID_ARGUMENT`, and `sync()` accepts any joined peer's messages.
+- `topic_update(topic_id, caller, metadata)`: Updates topic metadata. When modifying `"chair"` or `"muted"`, `caller` must match the existing chair (or reject with `NOT_CHAIR`). Removing `"chair"` reverts the topic to unchaired.
+- `chair_mute(topic_id, caller, target)` / `chair_unmute(topic_id, caller, target)`: Chair-only moderation. Mutes/unmutes a peer by updating the `metadata.muted` list and posting a system notice to the topic. The chair cannot be muted.
+- **Hard mute enforcement**: On chaired topics, `sync()` rejects non-empty outboxes from muted peers with error code `MUTED`. Read-only calls (`outbox: []`) succeed so muted peers can continue observing topic history.
+- `sync()` includes `topic_metadata` in structured output so clients can track mute state without extra round-trips.
+
+### 4.9 Binding polls and voting semantics
+
+The chair can conduct binding decision polls on chaired topics:
+
+- `poll_open(topic_id, caller, question, options?, threshold?)`: Chair only. Only one poll may be open per topic; opening a new poll supersedes any earlier open poll. Options default to `["yay", "nay", "abstain"]`; threshold can be `"majority"`, `"two-thirds"`, or `"plurality"`. Posts an in-band announcement message to topic history.
+- `poll_vote(poll_id, caller, choice)`: Any joined peer. Each peer gets exactly one changeable vote (`poll_votes` table PK `(poll_id, agent_name)`). Unjoined peers receive `AGENT_NOT_JOINED`; invalid choices receive `INVALID_ARGUMENT`.
+- `poll_status(poll_id)`: Any peer. Returns live vote counts and voter choices without modifying poll status.
+- `poll_close(poll_id, caller)`: Chair only. Marks the poll `closed` and tallies ballots using Robert's Rules of Order:
+  - `majority`: >50% of non-abstain ballots (`ADOPTED` / `REJECTED` / `DEADLOCKED`).
+  - `two-thirds`: ≥66.7% of non-abstain ballots.
+  - `plurality`: most votes wins; ties result in `DEADLOCKED`.
+  - Atomically writes the verified result message into topic history in the same transaction:
+    `POLL CLOSED: <question> → <tally> → <verdict> (<threshold>)`.
+- Voting on closed or superseded polls rejects with `POLL_CLOSED`.
 
 ## 5) HTTP deployment: auth, ownership, admin
 
