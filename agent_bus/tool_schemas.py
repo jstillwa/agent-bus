@@ -192,3 +192,96 @@ class SyncOutput(ToolOutputBase):
     received: list[MessageInfo] | None = None
     received_count: int | None = None
     has_more: bool | None = None
+    topic_metadata: dict[str, Any] | None = None
+
+
+class TopicUpdateOutput(ToolOutputBase):
+    required_on_success = ("topic_id", "metadata")
+
+    topic_id: str | None = None
+    metadata: dict[str, Any] | None = None
+
+
+class ChairMuteOutput(ToolOutputBase):
+    required_on_success = ("topic_id", "target", "muted")
+
+    topic_id: str | None = None
+    target: str | None = None
+    muted: bool | None = None
+
+
+class ChairUnmuteOutput(ToolOutputBase):
+    required_on_success = ("topic_id", "target", "muted")
+
+    topic_id: str | None = None
+    target: str | None = None
+    muted: bool | None = None
+
+
+class PollOpenOutput(ToolOutputBase):
+    required_on_success = ("poll_id", "topic_id", "question", "options", "threshold", "status")
+
+    poll_id: str | None = None
+    topic_id: str | None = None
+    question: str | None = None
+    options: list[str] | None = None
+    threshold: str | None = None
+    status: str | None = None
+
+
+class PollVoteOutput(ToolOutputBase):
+    required_on_success = ("poll_id", "caller", "choice")
+
+    poll_id: str | None = None
+    caller: str | None = None
+    choice: str | None = None
+
+
+class PollCloseOutput(ToolOutputBase):
+    required_on_success = (
+        "poll_id",
+        "topic_id",
+        "question",
+        "status",
+        "tally",
+        "total_votes",
+        "verdict",
+        "threshold",
+        "result_message",
+    )
+
+    poll_id: str | None = None
+    topic_id: str | None = None
+    question: str | None = None
+    status: str | None = None
+    tally: dict[str, int] | None = None
+    total_votes: int | None = None
+    verdict: str | None = None
+    threshold: str | None = None
+    result_message: str | None = None
+
+
+class PollStatusOutput(ToolOutputBase):
+    required_on_success = (
+        "poll_id",
+        "topic_id",
+        "question",
+        "options",
+        "threshold",
+        "status",
+        "tally",
+        "total_votes",
+    )
+
+    poll_id: str | None = None
+    topic_id: str | None = None
+    question: str | None = None
+    options: list[str] | None = None
+    threshold: str | None = None
+    status: str | None = None
+    created_by: str | None = None
+    created_at: float | None = None
+    closed_at: float | None = None
+    tally: dict[str, int] | None = None
+    total_votes: int | None = None
+    votes: dict[str, str] | None = None

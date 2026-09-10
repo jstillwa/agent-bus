@@ -5,8 +5,12 @@ from typing import Any, Literal
 
 from agent_bus._core import (  # type: ignore[import-not-found]
     AgentNameInUseError,
+    AgentNotJoinedError,
     CoreDb,
     DBBusyError,
+    MutedError,
+    PollClosedError,
+    PollNotFoundError,
     SchemaMismatchError,
     TopicClosedError,
     TopicMismatchError,
@@ -17,12 +21,16 @@ from agent_bus.models import Cursor, Message, Topic
 
 TopicStatus = Literal["open", "closed"]
 
-SCHEMA_VERSION = "6"
+SCHEMA_VERSION = "7"
 
 __all__ = [
     "AgentBusDB",
     "AgentNameInUseError",
+    "AgentNotJoinedError",
     "DBBusyError",
+    "MutedError",
+    "PollClosedError",
+    "PollNotFoundError",
     "SchemaMismatchError",
     "TopicClosedError",
     "TopicMismatchError",
@@ -244,6 +252,56 @@ class AgentBusDB:
 
     def delete_topic(self, *, topic_id: str) -> bool:
         return bool(self._core.delete_topic(topic_id))
+
+    def topic_update_metadata(
+        self,
+        *,
+        topic_id: str,
+        metadata: dict[str, Any] | None,
+    ) -> Topic:
+        metadata_json = None if metadata is None else json_dumps(metadata)
+        data = self._core.topic_update_metadata(topic_id, metadata_json)
+        return _topic_from_dict(data)
+
+    def poll_create(
+        self,
+        *,
+        topic_id: str,
+        question: str,
+        options: list[str],
+        threshold: str = "majority",
+        created_by: str = "system",
+        poll_id: str | None = None,
+    ) -> dict[str, Any]:
+        options_json = json_dumps(options)
+        data = dict(
+            self._core.poll_create(
+                topic_id, question, options_json, threshold, created_by, poll_id
+            )
+        )
+        data["options"] = options
+        return data
+
+    def poll_get(self, *, poll_id: str) -> dict[str, Any] | None:
+        res = self._core.poll_get(poll_id)
+        if res is None:
+            return None
+        data = dict(res)
+        options_json = data.pop("options_json", "[]")
+        data["options"] = json_loads(options_json) if options_json else []
+        return data
+
+    def poll_vote(
+        self,
+        *,
+        poll_id: str,
+        caller: str,
+        choice: str,
+    ) -> dict[str, Any]:
+        return dict(self._core.poll_vote(poll_id, caller, choice))
+
+    def poll_close(self, *, poll_id: str) -> dict[str, Any]:
+        return dict(self._core.poll_close(poll_id))
 
     def topic_rename(
         self,

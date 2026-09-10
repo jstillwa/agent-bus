@@ -22,8 +22,12 @@ create_exception!(agent_bus_core, TopicNotFoundError, PyRuntimeError);
 create_exception!(agent_bus_core, TopicClosedError, PyRuntimeError);
 create_exception!(agent_bus_core, TopicMismatchError, PyRuntimeError);
 create_exception!(agent_bus_core, AgentNameInUseError, PyRuntimeError);
+create_exception!(agent_bus_core, MutedError, PyRuntimeError);
+create_exception!(agent_bus_core, PollNotFoundError, PyRuntimeError);
+create_exception!(agent_bus_core, PollClosedError, PyRuntimeError);
+create_exception!(agent_bus_core, AgentNotJoinedError, PyRuntimeError);
 
-const SCHEMA_VERSION: &str = "6";
+const SCHEMA_VERSION: &str = "7";
 const TOPICS_VERSION_META_KEY: &str = "topics_version";
 const DEFAULT_EMBEDDING_MODEL: &str = "BAAI/bge-small-en-v1.5";
 const DEFAULT_MAX_TOKENS: usize = 512;
@@ -1521,6 +1525,13 @@ impl CoreDb {
             params![topic_id],
         )
         .map_err(map_db_error)?;
+        tx.execute(
+            "DELETE FROM poll_votes WHERE poll_id IN (SELECT poll_id FROM polls WHERE topic_id = ?)",
+            params![topic_id],
+        )
+        .map_err(map_db_error)?;
+        tx.execute("DELETE FROM polls WHERE topic_id = ?", params![topic_id])
+            .map_err(map_db_error)?;
         tx.execute("DELETE FROM topics WHERE topic_id = ?", params![topic_id])
             .map_err(map_db_error)?;
         bump_topics_version(&tx).map_err(map_db_error)?;
@@ -1893,19 +1904,44 @@ impl CoreDb {
         let mut conn = self.connect()?;
         let tx = conn.transaction().map_err(map_db_error)?;
 
-        let topic_status: Option<String> = tx
+        let topic_info: Option<(String, bool)> = tx
             .query_row(
-                "SELECT status FROM topics WHERE topic_id = ?",
-                params![topic_id],
-                |r| r.get(0),
+                "
+                SELECT
+                  status,
+                  CASE
+                    WHEN json_valid(metadata_json) = 1
+                         AND json_extract(metadata_json, '$.chair') IS NOT NULL
+                         AND json_extract(metadata_json, '$.chair') != ?
+                         AND EXISTS (
+                           SELECT 1
+                           FROM json_each(json_extract(metadata_json, '$.muted'))
+                           WHERE value = ?
+                         )
+                    THEN 1
+                    ELSE 0
+                  END
+                FROM topics
+                WHERE topic_id = ?
+                ",
+                params![&agent_name, &agent_name, &topic_id],
+                |r| Ok((r.get(0)?, r.get::<_, i64>(1)? != 0)),
             )
             .optional()
             .map_err(map_db_error)?;
-        let Some(status) = topic_status else {
+
+        let Some((status, is_muted)) = topic_info else {
             return Err(TopicNotFoundError::new_err(topic_id));
         };
-        if !outbox.is_empty() && status != "open" {
-            return Err(TopicClosedError::new_err("topic closed"));
+        if !outbox.is_empty() {
+            if status != "open" {
+                return Err(TopicClosedError::new_err("topic closed"));
+            }
+            if is_muted {
+                return Err(MutedError::new_err(format!(
+                    "agent '{agent_name}' is muted in topic '{topic_id}'"
+                )));
+            }
         }
 
         let cursor_opt: Option<CursorRow> = tx
@@ -2487,6 +2523,508 @@ impl CoreDb {
         }
         Ok(out.into())
     }
+
+    fn topic_update_metadata(
+        &self,
+        py: Python<'_>,
+        topic_id: String,
+        metadata_json: Option<String>,
+    ) -> PyResult<Py<PyAny>> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction().map_err(map_db_error)?;
+        let row = tx
+            .query_row(
+                "
+                SELECT topic_id, name, status, created_at, closed_at, close_reason, metadata_json
+                FROM topics
+                WHERE topic_id = ?
+                ",
+                params![topic_id],
+                topic_row_from,
+            )
+            .optional()
+            .map_err(map_db_error)?;
+        let existing = row.ok_or_else(|| TopicNotFoundError::new_err(topic_id.clone()))?;
+
+        tx.execute(
+            "
+            UPDATE topics
+            SET metadata_json = ?
+            WHERE topic_id = ?
+            ",
+            params![metadata_json, existing.topic_id],
+        )
+        .map_err(map_db_error)?;
+        bump_topics_version(&tx).map_err(map_db_error)?;
+        tx.commit().map_err(map_db_error)?;
+
+        let updated = TopicRow {
+            topic_id: existing.topic_id,
+            name: existing.name,
+            status: existing.status,
+            created_at: existing.created_at,
+            closed_at: existing.closed_at,
+            close_reason: existing.close_reason,
+            metadata_json,
+        };
+        Ok(topic_to_dict(py, &updated))
+    }
+
+    #[pyo3(signature = (topic_id, question, options_json, threshold="majority".to_string(), created_by="system".to_string(), poll_id=None))]
+    fn poll_create(
+        &self,
+        py: Python<'_>,
+        topic_id: String,
+        question: String,
+        options_json: String,
+        threshold: String,
+        created_by: String,
+        poll_id: Option<String>,
+    ) -> PyResult<Py<PyAny>> {
+        let poll_id = poll_id.unwrap_or_else(new_id);
+        let created_at = now();
+
+        let mut conn = self.connect()?;
+        let tx = conn.transaction().map_err(map_db_error)?;
+
+        let topic_status: Option<String> = tx
+            .query_row(
+                "SELECT status FROM topics WHERE topic_id = ?",
+                params![&topic_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(map_db_error)?;
+        let Some(status) = topic_status else {
+            return Err(TopicNotFoundError::new_err(topic_id));
+        };
+        if status != "open" {
+            return Err(TopicClosedError::new_err("topic closed"));
+        }
+
+        tx.execute(
+            "
+            UPDATE polls
+            SET status = 'superseded', closed_at = ?
+            WHERE topic_id = ? AND status = 'open'
+            ",
+            params![created_at, &topic_id],
+        )
+        .map_err(map_db_error)?;
+
+        tx.execute(
+            "
+            INSERT INTO polls(
+              poll_id, topic_id, question, options_json, threshold,
+              status, created_by, created_at, closed_at
+            )
+            VALUES (?, ?, ?, ?, ?, 'open', ?, ?, NULL)
+            ",
+            params![
+                &poll_id,
+                &topic_id,
+                &question,
+                &options_json,
+                &threshold,
+                &created_by,
+                created_at,
+            ],
+        )
+        .map_err(map_db_error)?;
+
+        tx.commit().map_err(map_db_error)?;
+
+        let dict = PyDict::new(py);
+        dict.set_item("poll_id", &poll_id)?;
+        dict.set_item("topic_id", &topic_id)?;
+        dict.set_item("question", &question)?;
+        dict.set_item("options_json", &options_json)?;
+        dict.set_item("threshold", &threshold)?;
+        dict.set_item("status", "open")?;
+        dict.set_item("created_by", &created_by)?;
+        dict.set_item("created_at", created_at)?;
+        dict.set_item("closed_at", py.None())?;
+        Ok(dict.into())
+    }
+
+    fn poll_get(
+        &self,
+        py: Python<'_>,
+        poll_id: String,
+    ) -> PyResult<Option<Py<PyAny>>> {
+        let conn = self.connect()?;
+        let poll_row: Option<(String, String, String, String, String, String, String, f64, Option<f64>)> = conn
+            .query_row(
+                "
+                SELECT
+                  poll_id, topic_id, question, options_json, threshold,
+                  status, created_by, created_at, closed_at
+                FROM polls
+                WHERE poll_id = ?
+                ",
+                params![&poll_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?)),
+            )
+            .optional()
+            .map_err(map_db_error)?;
+
+        let Some((pid, topic_id, question, options_json, threshold, status, created_by, created_at, closed_at)) = poll_row else {
+            return Ok(None);
+        };
+
+        let mut stmt = conn
+            .prepare("SELECT agent_name, choice, updated_at FROM poll_votes WHERE poll_id = ? ORDER BY updated_at ASC")
+            .map_err(map_db_error)?;
+        let votes = stmt
+            .query_map(params![&pid], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, f64>(2)?)))
+            .map_err(map_db_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(map_db_error)?;
+
+        let dict = PyDict::new(py);
+        dict.set_item("poll_id", &pid)?;
+        dict.set_item("topic_id", &topic_id)?;
+        dict.set_item("question", &question)?;
+        dict.set_item("options_json", &options_json)?;
+        dict.set_item("threshold", &threshold)?;
+        dict.set_item("status", &status)?;
+        dict.set_item("created_by", &created_by)?;
+        dict.set_item("created_at", created_at)?;
+        dict.set_item("closed_at", closed_at)?;
+
+        let votes_list = PyList::empty(py);
+        for (agent_name, choice, updated_at) in &votes {
+            let t = PyTuple::new(py, &[agent_name.into_py_any(py)?, choice.into_py_any(py)?, updated_at.into_py_any(py)?])?;
+            votes_list.append(t)?;
+        }
+        dict.set_item("votes", votes_list)?;
+
+        Ok(Some(dict.into()))
+    }
+
+    fn poll_vote(
+        &self,
+        py: Python<'_>,
+        poll_id: String,
+        agent_name: String,
+        choice: String,
+    ) -> PyResult<Py<PyAny>> {
+        let updated_at = now();
+        let mut conn = self.connect()?;
+        let tx = conn.transaction().map_err(map_db_error)?;
+
+        let poll_row: Option<(String, String, String)> = tx
+            .query_row(
+                "SELECT topic_id, options_json, status FROM polls WHERE poll_id = ?",
+                params![&poll_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()
+            .map_err(map_db_error)?;
+
+        let Some((topic_id, options_json, status)) = poll_row else {
+            return Err(PollNotFoundError::new_err(format!("Poll '{poll_id}' not found.")));
+        };
+
+        if status != "open" {
+            return Err(PollClosedError::new_err(format!("Poll '{poll_id}' is closed (status: {status}).")));
+        }
+
+        let is_joined: bool = tx
+            .query_row(
+                "
+                SELECT EXISTS(
+                  SELECT 1 FROM agent_name_reservations WHERE topic_id = ? AND agent_name = ?
+                  UNION
+                  SELECT 1 FROM cursors WHERE topic_id = ? AND agent_name = ?
+                )
+                ",
+                params![&topic_id, &agent_name, &topic_id, &agent_name],
+                |r| r.get(0),
+            )
+            .map_err(map_db_error)?;
+
+        if !is_joined {
+            return Err(AgentNotJoinedError::new_err(format!(
+                "Agent '{agent_name}' is not joined to topic '{topic_id}'."
+            )));
+        }
+
+        let is_valid_choice: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM json_each(?) WHERE value = ?)",
+                params![&options_json, &choice],
+                |r| r.get(0),
+            )
+            .map_err(map_db_error)?;
+
+        if !is_valid_choice {
+            return Err(PyValueError::new_err(format!(
+                "Choice '{choice}' is not one of the allowed options: {options_json}"
+            )));
+        }
+
+        tx.execute(
+            "
+            INSERT INTO poll_votes(poll_id, agent_name, choice, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(poll_id, agent_name) DO UPDATE SET choice = excluded.choice, updated_at = excluded.updated_at
+            ",
+            params![&poll_id, &agent_name, &choice, updated_at],
+        )
+        .map_err(map_db_error)?;
+
+        tx.commit().map_err(map_db_error)?;
+
+        let dict = PyDict::new(py);
+        dict.set_item("poll_id", &poll_id)?;
+        dict.set_item("agent_name", &agent_name)?;
+        dict.set_item("choice", &choice)?;
+        dict.set_item("updated_at", updated_at)?;
+        Ok(dict.into())
+    }
+
+    fn poll_close(
+        &self,
+        py: Python<'_>,
+        poll_id: String,
+    ) -> PyResult<Py<PyAny>> {
+        let closed_at = now();
+        let mut conn = self.connect()?;
+        let tx = conn.transaction().map_err(map_db_error)?;
+
+        let poll_row: Option<(String, String, String, String, String, String, f64)> = tx
+            .query_row(
+                "
+                SELECT topic_id, question, options_json, threshold, status, created_by, created_at
+                FROM polls
+                WHERE poll_id = ?
+                ",
+                params![&poll_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)),
+            )
+            .optional()
+            .map_err(map_db_error)?;
+
+        let Some((topic_id, question, options_json, threshold, status, created_by, created_at)) = poll_row else {
+            return Err(PollNotFoundError::new_err(format!("Poll '{poll_id}' not found.")));
+        };
+
+        if status != "open" {
+            return Err(PollClosedError::new_err(format!("Poll '{poll_id}' is closed (status: {status}).")));
+        }
+
+        tx.execute(
+            "UPDATE polls SET status = 'closed', closed_at = ? WHERE poll_id = ?",
+            params![closed_at, &poll_id],
+        )
+        .map_err(map_db_error)?;
+
+        let options: Vec<String> = {
+            let mut stmt = tx.prepare("SELECT value FROM json_each(?)").map_err(map_db_error)?;
+            let rows = stmt.query_map(params![&options_json], |r| r.get(0))
+                .map_err(map_db_error)?
+                .collect::<Result<Vec<String>, _>>()
+                .map_err(map_db_error)?;
+            rows
+        };
+
+        let votes: Vec<(String, String)> = {
+            let mut stmt = tx
+                .prepare("SELECT agent_name, choice FROM poll_votes WHERE poll_id = ?")
+                .map_err(map_db_error)?;
+            let rows = stmt
+                .query_map(params![&poll_id], |r| Ok((r.get(0)?, r.get(1)?)))
+                .map_err(map_db_error)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(map_db_error)?;
+            rows
+        };
+
+        let mut tally: HashMap<String, usize> = HashMap::new();
+        for opt in &options {
+            tally.insert(opt.clone(), 0);
+        }
+        for (_voter, choice) in &votes {
+            *tally.entry(choice.clone()).or_insert(0) += 1;
+        }
+
+        let total_votes = votes.len();
+
+        let tally_parts: Vec<String> = options
+            .iter()
+            .map(|opt| format!("{} {}", opt, tally.get(opt).copied().unwrap_or(0)))
+            .collect();
+        let tally_str = tally_parts.join(" / ");
+
+        let yay_opt = options.iter().find(|o| o.eq_ignore_ascii_case("yay"));
+        let nay_opt = options.iter().find(|o| o.eq_ignore_ascii_case("nay"));
+
+        let verdict = if yay_opt.is_some() && nay_opt.is_some() {
+            let yay = yay_opt.and_then(|o| tally.get(o)).copied().unwrap_or(0);
+            let nay = nay_opt.and_then(|o| tally.get(o)).copied().unwrap_or(0);
+            let non_abstain = yay + nay;
+
+            match threshold.as_str() {
+                "two-thirds" => {
+                    if non_abstain == 0 {
+                        "DEADLOCKED"
+                    } else if (yay as f64) / (non_abstain as f64) >= (2.0 / 3.0 - 0.00001) {
+                        "ADOPTED"
+                    } else if (nay as f64) / (non_abstain as f64) >= (2.0 / 3.0 - 0.00001) {
+                        "REJECTED"
+                    } else {
+                        "DEADLOCKED"
+                    }
+                }
+                "plurality" => {
+                    if non_abstain == 0 {
+                        "DEADLOCKED"
+                    } else if yay > nay {
+                        "ADOPTED"
+                    } else if nay > yay {
+                        "REJECTED"
+                    } else {
+                        "DEADLOCKED"
+                    }
+                }
+                _ => {
+                    if non_abstain == 0 {
+                        "DEADLOCKED"
+                    } else if yay > nay && (yay as f64) > (non_abstain as f64 / 2.0) {
+                        "ADOPTED"
+                    } else if nay > yay && (nay as f64) > (non_abstain as f64 / 2.0) {
+                        "REJECTED"
+                    } else {
+                        "DEADLOCKED"
+                    }
+                }
+            }
+        } else {
+            let non_abstain_total: usize = options
+                .iter()
+                .filter(|o| !o.eq_ignore_ascii_case("abstain"))
+                .map(|o| tally.get(o).copied().unwrap_or(0))
+                .sum();
+
+            if non_abstain_total == 0 {
+                "DEADLOCKED"
+            } else {
+                let mut candidates: Vec<(&String, usize)> = options
+                    .iter()
+                    .filter(|o| !o.eq_ignore_ascii_case("abstain"))
+                    .map(|o| (o, tally.get(o).copied().unwrap_or(0)))
+                    .collect();
+                candidates.sort_by(|a, b| b.1.cmp(&a.1));
+
+                let top_count = candidates[0].1;
+                let tie = candidates.len() > 1 && candidates[1].1 == top_count;
+
+                if tie || top_count == 0 {
+                    "DEADLOCKED"
+                } else {
+                    match threshold.as_str() {
+                        "two-thirds" => {
+                            if (top_count as f64) / (non_abstain_total as f64) >= (2.0 / 3.0 - 0.00001) {
+                                "ADOPTED"
+                            } else {
+                                "DEADLOCKED"
+                            }
+                        }
+                        "majority" => {
+                            if (top_count as f64) > (non_abstain_total as f64 / 2.0) {
+                                "ADOPTED"
+                            } else {
+                                "DEADLOCKED"
+                            }
+                        }
+                        _ => "ADOPTED",
+                    }
+                }
+            }
+        };
+
+        let result_text = format!(
+            "POLL CLOSED: {} \u{2192} {} \u{2192} {} ({})",
+            question, tally_str, verdict, threshold
+        );
+
+        let message_id = new_id();
+        let next_seq: i64 = {
+            let opt: Option<i64> = tx
+                .query_row(
+                    "SELECT next_seq FROM topic_seq WHERE topic_id = ?",
+                    params![&topic_id],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(map_db_error)?;
+            match opt {
+                Some(s) => s,
+                None => {
+                    tx.execute(
+                        "INSERT OR IGNORE INTO topic_seq(topic_id, next_seq, updated_at) VALUES (?, 1, ?)",
+                        params![&topic_id, closed_at],
+                    )
+                    .map_err(map_db_error)?;
+                    1
+                }
+            }
+        };
+
+        tx.execute(
+            "
+            INSERT INTO messages(
+              message_id, topic_id, seq, sender, message_type, reply_to,
+              content_markdown, metadata_json, client_message_id, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ",
+            params![
+                message_id,
+                topic_id,
+                next_seq,
+                "system",
+                "system",
+                Option::<String>::None,
+                result_text,
+                Option::<String>::None,
+                Option::<String>::None,
+                closed_at,
+            ],
+        )
+        .map_err(map_db_error)?;
+
+        tx.execute(
+            "UPDATE topic_seq SET next_seq = ?, updated_at = ? WHERE topic_id = ?",
+            params![next_seq + 1, closed_at, topic_id],
+        )
+        .map_err(map_db_error)?;
+
+        bump_topics_version(&tx).map_err(map_db_error)?;
+        tx.commit().map_err(map_db_error)?;
+
+        let dict = PyDict::new(py);
+        dict.set_item("poll_id", &poll_id)?;
+        dict.set_item("topic_id", &topic_id)?;
+        dict.set_item("question", &question)?;
+        dict.set_item("threshold", &threshold)?;
+        dict.set_item("status", "closed")?;
+        dict.set_item("created_by", &created_by)?;
+        dict.set_item("created_at", created_at)?;
+        dict.set_item("closed_at", closed_at)?;
+        dict.set_item("verdict", verdict)?;
+        dict.set_item("total_votes", total_votes)?;
+        dict.set_item("result_message", &result_text)?;
+
+        let tally_dict = PyDict::new(py);
+        for (opt, cnt) in &tally {
+            tally_dict.set_item(opt, *cnt)?;
+        }
+        dict.set_item("tally", tally_dict)?;
+
+        Ok(dict.into())
+    }
 }
 
 #[pymodule]
@@ -2499,6 +3037,10 @@ fn _core(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add("TopicClosedError", py.get_type::<TopicClosedError>())?;
     module.add("TopicMismatchError", py.get_type::<TopicMismatchError>())?;
     module.add("AgentNameInUseError", py.get_type::<AgentNameInUseError>())?;
+    module.add("MutedError", py.get_type::<MutedError>())?;
+    module.add("PollNotFoundError", py.get_type::<PollNotFoundError>())?;
+    module.add("PollClosedError", py.get_type::<PollClosedError>())?;
+    module.add("AgentNotJoinedError", py.get_type::<AgentNotJoinedError>())?;
     module.add("SCHEMA_VERSION", SCHEMA_VERSION)?;
     Ok(())
 }
@@ -2615,6 +3157,45 @@ impl CoreDb {
                 )
                 .optional()
                 .map_err(map_db_error)?;
+
+            if version.as_deref() == Some("6") {
+                conn.execute_batch(
+                    "
+                    CREATE TABLE IF NOT EXISTS polls (
+                      poll_id TEXT PRIMARY KEY,
+                      topic_id TEXT NOT NULL,
+                      question TEXT NOT NULL,
+                      options_json TEXT NOT NULL,
+                      threshold TEXT NOT NULL DEFAULT 'majority',
+                      status TEXT NOT NULL DEFAULT 'open',
+                      created_by TEXT NOT NULL,
+                      created_at REAL NOT NULL,
+                      closed_at REAL NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS poll_votes (
+                      poll_id TEXT NOT NULL,
+                      agent_name TEXT NOT NULL,
+                      choice TEXT NOT NULL,
+                      updated_at REAL NOT NULL,
+                      PRIMARY KEY (poll_id, agent_name)
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_polls_topic_status
+                      ON polls(topic_id, status);
+                    UPDATE meta SET value = '7' WHERE key = 'schema_version';
+                    ",
+                )
+                .map_err(map_db_error)?;
+            }
+
+            let version: Option<String> = conn
+                .query_row(
+                    "SELECT value FROM meta WHERE key = 'schema_version'",
+                    [],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(map_db_error)?;
+
             if version.as_deref() != Some(SCHEMA_VERSION) {
                 return Err(SchemaMismatchError::new_err(
                     "Database schema version mismatch. Wipe it with `agent-bus cli db wipe --yes` or delete the file at $AGENT_BUS_DB.",
@@ -2695,6 +3276,29 @@ impl CoreDb {
             CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_topic_sender_client_id_unique
               ON messages(topic_id, sender, client_message_id)
               WHERE client_message_id IS NOT NULL;
+
+            CREATE TABLE IF NOT EXISTS polls (
+              poll_id TEXT PRIMARY KEY,
+              topic_id TEXT NOT NULL,
+              question TEXT NOT NULL,
+              options_json TEXT NOT NULL,
+              threshold TEXT NOT NULL DEFAULT 'majority',
+              status TEXT NOT NULL DEFAULT 'open',
+              created_by TEXT NOT NULL,
+              created_at REAL NOT NULL,
+              closed_at REAL NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS poll_votes (
+              poll_id TEXT NOT NULL,
+              agent_name TEXT NOT NULL,
+              choice TEXT NOT NULL,
+              updated_at REAL NOT NULL,
+              PRIMARY KEY (poll_id, agent_name)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_polls_topic_status
+              ON polls(topic_id, status);
             ",
         )
         .map_err(map_db_error)?;

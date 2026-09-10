@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import time
 import unicodedata
 from dataclasses import dataclass
@@ -25,22 +26,34 @@ from agent_bus.common import (
 from agent_bus.db import (
     AgentBusDB,
     AgentNameInUseError,
+    AgentNotJoinedError,
     DBBusyError,
+    MutedError,
+    PollClosedError,
+    PollNotFoundError,
     SchemaMismatchError,
     TopicClosedError,
     TopicNotFoundError,
 )
 from agent_bus.ownership import (
+    OWNER_KEY,
     is_visible,
     is_visible_topic_id,
+    owner_key,
     resolve_owned_topic,
     sanitize_topic_metadata,
     visible_topics,
 )
 from agent_bus.tool_schemas import (
+    ChairMuteOutput,
+    ChairUnmuteOutput,
     CursorResetOutput,
     MessagesSearchOutput,
     PingOutput,
+    PollCloseOutput,
+    PollOpenOutput,
+    PollStatusOutput,
+    PollVoteOutput,
     SyncOutput,
     TopicCloseOutput,
     TopicCreateOutput,
@@ -48,6 +61,7 @@ from agent_bus.tool_schemas import (
     TopicListOutput,
     TopicPresenceOutput,
     TopicResolveOutput,
+    TopicUpdateOutput,
 )
 from agent_bus.version import __version__
 
@@ -100,6 +114,19 @@ class JoinedIdentity:
 _joined_identities: dict[str, JoinedIdentity] = {}
 
 
+def _session_key(topic_id: str) -> str:
+    try:
+        ctx = mcp.get_context()
+        session_id = getattr(ctx, "client_id", None) or (
+            str(id(ctx.session)) if getattr(ctx, "session", None) is not None else None
+        )
+        if session_id:
+            return f"{session_id}:{topic_id}"
+    except (LookupError, ValueError, AttributeError):
+        pass
+    return topic_id
+
+
 def _normalize_agent_name(agent_name: str) -> str:
     return agent_name.strip()
 
@@ -116,7 +143,7 @@ def _validate_agent_name(agent_name: object) -> str | None:
 
 
 def _agent_name_for_topic(topic_id: str) -> str | None:
-    identity = _joined_identities.get(topic_id)
+    identity = _joined_identities.get(_session_key(topic_id)) or _joined_identities.get(topic_id)
     return identity.agent_name if identity is not None else None
 
 
@@ -591,7 +618,8 @@ def topic_join(
         return tool_error(code=ErrorCode.DB_BUSY, message="Database is busy.")
 
     normalized = _normalize_agent_name(agent_name)
-    existing = _joined_identities.get(topic.topic_id)
+    s_key = _session_key(topic.topic_id)
+    existing = _joined_identities.get(s_key) or _joined_identities.get(topic.topic_id)
     if existing is not None and existing.agent_name == normalized:
         reclaim = existing.reclaim_token
     else:
@@ -620,10 +648,12 @@ def topic_join(
                     "suggested_agent_names": _suggest_agent_names(normalized),
                 },
             )
-        _joined_identities[topic.topic_id] = JoinedIdentity(
+        identity = JoinedIdentity(
             agent_name=normalized,
             reclaim_token=reclaim,
         )
+        _joined_identities[s_key] = identity
+        _joined_identities[topic.topic_id] = identity
 
     text = (
         f'Joined topic "{topic.name}" ({topic.topic_id}) as "{normalized}".\n'
@@ -1006,6 +1036,8 @@ async def sync(
         return tool_error(code=ErrorCode.TOPIC_NOT_FOUND, message="Topic not found.")
     except TopicClosedError:
         return tool_error(code=ErrorCode.TOPIC_CLOSED, message="Topic is closed.")
+    except MutedError as e:
+        return tool_error(code=ErrorCode.MUTED, message=str(e))
     except DBBusyError:
         return tool_error(code=ErrorCode.DB_BUSY, message="Database is busy.")
     except ValueError as e:
@@ -1085,6 +1117,10 @@ async def sync(
     structured_sent = [{"message": _msg_struct(m), "duplicate": dup} for m, dup in sent]
     structured_received = [_msg_struct(m) for m in received]
 
+    topic_metadata: dict[str, Any] | None = None
+    with contextlib.suppress(Exception):
+        topic_metadata = db.get_topic(topic_id=topic_id).metadata
+
     assert cursor is not None
     structured = {
         "topic_id": topic_id,
@@ -1095,6 +1131,7 @@ async def sync(
         "received": structured_received,
         "received_count": len(structured_received),
         "has_more": has_more,
+        "topic_metadata": topic_metadata,
     }
 
     lines = [
@@ -1122,6 +1159,425 @@ async def sync(
         lines.append(f"... ({len(structured_received) - 20} more)")
 
     return tool_ok(text="\n".join(lines), structured=structured, warnings=tool_warnings or None)
+
+
+@mcp.tool(
+    description=(
+        "Update metadata on a topic. On a chaired topic, only the chair may update metadata "
+        "(including chair handover or unchaired revert)."
+    )
+)
+def topic_update(
+    topic_id: str,
+    caller: Annotated[str, Field(description="Your agent name.")],
+    metadata: Annotated[dict[str, Any], Field(description="New topic metadata object.")],
+) -> Annotated[CallToolResult, TopicUpdateOutput]:
+    """Update topic metadata (chair only on chaired topics)."""
+    err = _topic_access_error(topic_id)
+    if err:
+        return err
+
+    try:
+        topic = db.get_topic(topic_id=topic_id)
+    except TopicNotFoundError:
+        return tool_error(code=ErrorCode.TOPIC_NOT_FOUND, message="Topic not found.")
+
+    if topic.status != "open":
+        return tool_error(code=ErrorCode.TOPIC_CLOSED, message="Topic is closed.")
+
+    if not isinstance(metadata, dict):
+        return tool_error(code=ErrorCode.INVALID_ARGUMENT, message="metadata must be a dictionary.")
+
+    existing_meta = topic.metadata or {}
+    existing_chair = existing_meta.get("chair")
+    if existing_chair and caller.strip() != existing_chair:
+        return tool_error(
+            code=ErrorCode.NOT_CHAIR,
+            message=f"Only the chair ({existing_chair}) may update topic metadata.",
+        )
+
+    clean_meta = {k: v for k, v in metadata.items() if not k.startswith("_")}
+    auth = _current_auth()
+    if auth is not None:
+        clean_meta[OWNER_KEY] = owner_key(auth)
+    elif OWNER_KEY in existing_meta:
+        clean_meta[OWNER_KEY] = existing_meta[OWNER_KEY]
+
+    try:
+        db.topic_update_metadata(topic_id=topic_id, metadata=clean_meta)
+    except DBBusyError:
+        return tool_error(code=ErrorCode.DB_BUSY, message="Database is busy.")
+
+    return tool_ok(
+        text=f'Topic metadata updated: topic_id="{topic_id}"',
+        structured={"topic_id": topic_id, "metadata": clean_meta},
+    )
+
+
+@mcp.tool(
+    description=(
+        "Mute a peer on a chaired topic (chair only). Muted peers cannot post messages to the topic."
+    )
+)
+def chair_mute(
+    topic_id: str,
+    caller: Annotated[str, Field(description="Your agent name (must be the topic chair).")],
+    target: Annotated[str, Field(description="Agent name to mute.")],
+) -> Annotated[CallToolResult, ChairMuteOutput]:
+    """Mute a peer on a chaired topic (chair only)."""
+    err = _topic_access_error(topic_id)
+    if err:
+        return err
+
+    try:
+        topic = db.get_topic(topic_id=topic_id)
+    except TopicNotFoundError:
+        return tool_error(code=ErrorCode.TOPIC_NOT_FOUND, message="Topic not found.")
+
+    if topic.status != "open":
+        return tool_error(code=ErrorCode.TOPIC_CLOSED, message="Topic is closed.")
+
+    meta = dict(topic.metadata or {})
+    chair = meta.get("chair")
+    if not chair:
+        return tool_error(code=ErrorCode.INVALID_ARGUMENT, message="Topic is not chaired.")
+    if caller.strip() != chair:
+        return tool_error(code=ErrorCode.NOT_CHAIR, message=f"Only the chair ({chair}) may mute peers.")
+
+    target_name = target.strip()
+    if not target_name:
+        return tool_error(code=ErrorCode.INVALID_ARGUMENT, message="target must be a non-empty string.")
+    if target_name == chair:
+        return tool_error(code=ErrorCode.INVALID_ARGUMENT, message="The chair cannot be muted.")
+
+    muted = list(meta.get("muted") or [])
+    if target_name not in muted:
+        muted.append(target_name)
+    meta["muted"] = muted
+
+    try:
+        db.topic_update_metadata(topic_id=topic_id, metadata=meta)
+    except DBBusyError:
+        return tool_error(code=ErrorCode.DB_BUSY, message="Database is busy.")
+
+    notice = f"SYSTEM: {target_name} has been muted by chair {caller.strip()}."
+    with contextlib.suppress(Exception):
+        db.sync_once(
+            topic_id=topic_id,
+            agent_name=caller.strip(),
+            outbox=[{"content_markdown": notice, "message_type": "system"}],
+            max_items=0,
+            include_self=False,
+            auto_advance=False,
+            ack_through=None,
+        )
+
+    return tool_ok(
+        text=notice,
+        structured={"topic_id": topic_id, "target": target_name, "muted": True},
+    )
+
+
+@mcp.tool(
+    description=(
+        "Unmute a peer on a chaired topic (chair only). Restores posting ability for the peer."
+    )
+)
+def chair_unmute(
+    topic_id: str,
+    caller: Annotated[str, Field(description="Your agent name (must be the topic chair).")],
+    target: Annotated[str, Field(description="Agent name to unmute.")],
+) -> Annotated[CallToolResult, ChairUnmuteOutput]:
+    """Unmute a peer on a chaired topic (chair only)."""
+    err = _topic_access_error(topic_id)
+    if err:
+        return err
+
+    try:
+        topic = db.get_topic(topic_id=topic_id)
+    except TopicNotFoundError:
+        return tool_error(code=ErrorCode.TOPIC_NOT_FOUND, message="Topic not found.")
+
+    if topic.status != "open":
+        return tool_error(code=ErrorCode.TOPIC_CLOSED, message="Topic is closed.")
+
+    meta = dict(topic.metadata or {})
+    chair = meta.get("chair")
+    if not chair:
+        return tool_error(code=ErrorCode.INVALID_ARGUMENT, message="Topic is not chaired.")
+    if caller.strip() != chair:
+        return tool_error(code=ErrorCode.NOT_CHAIR, message=f"Only the chair ({chair}) may unmute peers.")
+
+    target_name = target.strip()
+    if not target_name:
+        return tool_error(code=ErrorCode.INVALID_ARGUMENT, message="target must be a non-empty string.")
+
+    muted = [m for m in (meta.get("muted") or []) if m != target_name]
+    meta["muted"] = muted
+
+    try:
+        db.topic_update_metadata(topic_id=topic_id, metadata=meta)
+    except DBBusyError:
+        return tool_error(code=ErrorCode.DB_BUSY, message="Database is busy.")
+
+    notice = f"SYSTEM: {target_name} has been unmuted by chair {caller.strip()}."
+    with contextlib.suppress(Exception):
+        db.sync_once(
+            topic_id=topic_id,
+            agent_name=caller.strip(),
+            outbox=[{"content_markdown": notice, "message_type": "system"}],
+            max_items=0,
+            include_self=False,
+            auto_advance=False,
+            ack_through=None,
+        )
+
+    return tool_ok(
+        text=notice,
+        structured={"topic_id": topic_id, "target": target_name, "muted": False},
+    )
+
+
+@mcp.tool(
+    description=(
+        "Open a poll on a chaired topic (chair only). One open poll per topic; opening a second "
+        "poll supersedes any earlier open poll. Posts an announcement message to the topic."
+    )
+)
+def poll_open(
+    topic_id: str,
+    caller: Annotated[str, Field(description="Your agent name (must be the topic chair).")],
+    question: Annotated[str, Field(description="The poll question to decide.")],
+    options: Annotated[
+        list[str] | None,
+        Field(description="List of choices (default: ['yay', 'nay', 'abstain'])."),
+    ] = None,
+    threshold: Annotated[
+        Literal["majority", "two-thirds", "plurality"],
+        Field(description="Voting threshold required to adopt (default: 'majority')."),
+    ] = "majority",
+) -> Annotated[CallToolResult, PollOpenOutput]:
+    """Open a poll on a chaired topic (chair only)."""
+    err = _topic_access_error(topic_id)
+    if err:
+        return err
+
+    try:
+        topic = db.get_topic(topic_id=topic_id)
+    except TopicNotFoundError:
+        return tool_error(code=ErrorCode.TOPIC_NOT_FOUND, message="Topic not found.")
+
+    if topic.status != "open":
+        return tool_error(code=ErrorCode.TOPIC_CLOSED, message="Topic is closed.")
+
+    chair = (topic.metadata or {}).get("chair")
+    if not chair:
+        return tool_error(code=ErrorCode.INVALID_ARGUMENT, message="Topic is not chaired.")
+    if caller.strip() != chair:
+        return tool_error(code=ErrorCode.NOT_CHAIR, message=f"Only the chair ({chair}) may open a poll.")
+
+    q = question.strip()
+    if not q:
+        return tool_error(code=ErrorCode.INVALID_ARGUMENT, message="question must be a non-empty string.")
+
+    opts = options if options is not None else ["yay", "nay", "abstain"]
+    if not isinstance(opts, list) or len(opts) < 2:
+        return tool_error(code=ErrorCode.INVALID_ARGUMENT, message="options must contain at least 2 choices.")
+    if len(set(opts)) != len(opts):
+        return tool_error(code=ErrorCode.INVALID_ARGUMENT, message="options must be unique.")
+    for opt in opts:
+        if not isinstance(opt, str) or not opt.strip():
+            return tool_error(code=ErrorCode.INVALID_ARGUMENT, message="each option must be a non-empty string.")
+
+    if threshold not in ("majority", "two-thirds", "plurality"):
+        return tool_error(
+            code=ErrorCode.INVALID_ARGUMENT,
+            message="threshold must be 'majority', 'two-thirds', or 'plurality'.",
+        )
+
+    try:
+        created = db.poll_create(
+            topic_id=topic_id,
+            question=q,
+            options=opts,
+            threshold=threshold,
+            created_by=caller.strip(),
+        )
+    except DBBusyError:
+        return tool_error(code=ErrorCode.DB_BUSY, message="Database is busy.")
+
+    poll_id = created["poll_id"]
+    announcement = (
+        f"POLL OPENED: {q}\n"
+        f"Poll ID: {poll_id}\n"
+        f"Options: {', '.join(opts)}\n"
+        f"Threshold: {threshold}\n"
+        f'Vote with poll_vote(poll_id="{poll_id}", caller="<your_name>", choice="<option>")'
+    )
+    with contextlib.suppress(Exception):
+        db.sync_once(
+            topic_id=topic_id,
+            agent_name=caller.strip(),
+            outbox=[{
+                "content_markdown": announcement,
+                "message_type": "system",
+                "metadata": {"poll_id": poll_id, "options": opts, "threshold": threshold},
+            }],
+            max_items=0,
+            include_self=False,
+            auto_advance=False,
+            ack_through=None,
+        )
+
+    return tool_ok(
+        text=announcement,
+        structured={
+            "poll_id": poll_id,
+            "topic_id": topic_id,
+            "question": q,
+            "options": opts,
+            "threshold": threshold,
+            "status": "open",
+        },
+    )
+
+
+@mcp.tool(
+    description=(
+        "Cast a vote in an open poll. Each joined peer has exactly one changeable vote (last vote wins)."
+    )
+)
+def poll_vote(
+    poll_id: str,
+    caller: Annotated[str, Field(description="Your agent name (must be joined to the topic).")],
+    choice: Annotated[str, Field(description="Your chosen option.")],
+) -> Annotated[CallToolResult, PollVoteOutput]:
+    """Cast a vote in an open poll."""
+    caller_name = caller.strip()
+    if not caller_name:
+        return tool_error(code=ErrorCode.INVALID_ARGUMENT, message="caller must be a non-empty string.")
+    choice_val = choice.strip()
+    if not choice_val:
+        return tool_error(code=ErrorCode.INVALID_ARGUMENT, message="choice must be a non-empty string.")
+
+    try:
+        db.poll_vote(poll_id=poll_id, caller=caller_name, choice=choice_val)
+    except PollNotFoundError:
+        return tool_error(code=ErrorCode.POLL_NOT_FOUND, message=f"Poll '{poll_id}' not found.")
+    except PollClosedError as e:
+        return tool_error(code=ErrorCode.POLL_CLOSED, message=str(e))
+    except AgentNotJoinedError as e:
+        return tool_error(code=ErrorCode.AGENT_NOT_JOINED, message=str(e))
+    except ValueError as e:
+        return tool_error(code=ErrorCode.INVALID_ARGUMENT, message=str(e))
+    except DBBusyError:
+        return tool_error(code=ErrorCode.DB_BUSY, message="Database is busy.")
+
+    return tool_ok(
+        text=f"Vote recorded for {caller_name}: {choice_val} in poll {poll_id}",
+        structured={"poll_id": poll_id, "caller": caller_name, "choice": choice_val},
+    )
+
+
+@mcp.tool(
+    description=(
+        "Close an open poll and record the final tally and verdict into the topic (chair only)."
+    )
+)
+def poll_close(
+    poll_id: str,
+    caller: Annotated[str, Field(description="Your agent name (must be the topic chair).")],
+) -> Annotated[CallToolResult, PollCloseOutput]:
+    """Close an open poll (chair only)."""
+    poll_data = db.poll_get(poll_id=poll_id)
+    if poll_data is None:
+        return tool_error(code=ErrorCode.POLL_NOT_FOUND, message=f"Poll '{poll_id}' not found.")
+
+    if poll_data["status"] != "open":
+        return tool_error(
+            code=ErrorCode.POLL_CLOSED,
+            message=f"Poll '{poll_id}' is already closed (status: {poll_data['status']}).",
+        )
+
+    err = _topic_access_error(poll_data["topic_id"])
+    if err:
+        return err
+
+    try:
+        topic = db.get_topic(topic_id=poll_data["topic_id"])
+    except TopicNotFoundError:
+        return tool_error(code=ErrorCode.TOPIC_NOT_FOUND, message="Topic not found.")
+
+    chair = (topic.metadata or {}).get("chair")
+    if not chair:
+        return tool_error(code=ErrorCode.INVALID_ARGUMENT, message="Topic is not chaired.")
+    if caller.strip() != chair:
+        return tool_error(code=ErrorCode.NOT_CHAIR, message=f"Only the chair ({chair}) may close this poll.")
+
+    try:
+        result = db.poll_close(poll_id=poll_id)
+    except PollNotFoundError:
+        return tool_error(code=ErrorCode.POLL_NOT_FOUND, message=f"Poll '{poll_id}' not found.")
+    except PollClosedError as e:
+        return tool_error(code=ErrorCode.POLL_CLOSED, message=str(e))
+    except DBBusyError:
+        return tool_error(code=ErrorCode.DB_BUSY, message="Database is busy.")
+
+    return tool_ok(
+        text=result["result_message"],
+        structured={
+            "poll_id": poll_id,
+            "topic_id": result["topic_id"],
+            "question": result["question"],
+            "status": "closed",
+            "tally": result["tally"],
+            "total_votes": result["total_votes"],
+            "verdict": result["verdict"],
+            "threshold": result["threshold"],
+            "result_message": result["result_message"],
+        },
+    )
+
+
+@mcp.tool(description="Get status and current tally for a poll.")
+def poll_status(poll_id: str) -> Annotated[CallToolResult, PollStatusOutput]:
+    """Get status and current tally for a poll."""
+    poll_data = db.poll_get(poll_id=poll_id)
+    if poll_data is None:
+        return tool_error(code=ErrorCode.POLL_NOT_FOUND, message=f"Poll '{poll_id}' not found.")
+
+    options = poll_data.get("options") or []
+    votes = poll_data.get("votes") or []
+    tally = {opt: 0 for opt in options}
+    voters = {}
+    for voter, choice, _ in votes:
+        tally[choice] = tally.get(choice, 0) + 1
+        voters[voter] = choice
+
+    total_votes = len(votes)
+    lines = [
+        f"Poll: id={poll_id} status={poll_data['status']} threshold={poll_data['threshold']}",
+        f"Question: {poll_data['question']}",
+        f"Tally ({total_votes} votes): " + " / ".join(f"{opt} {tally.get(opt, 0)}" for opt in options),
+    ]
+
+    return tool_ok(
+        text="\n".join(lines),
+        structured={
+            "poll_id": poll_id,
+            "topic_id": poll_data["topic_id"],
+            "question": poll_data["question"],
+            "options": options,
+            "threshold": poll_data["threshold"],
+            "status": poll_data["status"],
+            "created_by": poll_data["created_by"],
+            "created_at": poll_data["created_at"],
+            "closed_at": poll_data["closed_at"],
+            "tally": tally,
+            "total_votes": total_votes,
+            "votes": voters,
+        },
+    )
 
 
 def main(
