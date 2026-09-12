@@ -98,6 +98,7 @@ async def test_two_process_smoke(tmp_path):
                 "sync",
                 {
                     "topic_id": topic_id,
+                    "agent_name": "red-squirrel",
                     "outbox": [{"content_markdown": "hello", "message_type": "message"}],
                     "wait_seconds": 0,
                 },
@@ -111,7 +112,7 @@ async def test_two_process_smoke(tmp_path):
 
             drained = await agent_b.call_tool(
                 "sync",
-                {"topic_id": topic_id, "wait_seconds": 0},
+                {"topic_id": topic_id, "agent_name": "crimson-cat", "wait_seconds": 0},
             )
             assert drained.isError is False
             assert drained.structuredContent["status"] == "ready"
@@ -126,6 +127,7 @@ async def test_two_process_smoke(tmp_path):
                 "sync",
                 {
                     "topic_id": topic_id,
+                    "agent_name": "red-squirrel",
                     "outbox": json.dumps(
                         [{"content_markdown": "hello-json", "message_type": "message"}]
                     ),
@@ -141,7 +143,7 @@ async def test_two_process_smoke(tmp_path):
 
             drained_json_string = await agent_b.call_tool(
                 "sync",
-                {"topic_id": topic_id, "wait_seconds": 0},
+                {"topic_id": topic_id, "agent_name": "crimson-cat", "wait_seconds": 0},
             )
             assert drained_json_string.isError is False
             assert drained_json_string.structuredContent["received_count"] == 1
@@ -175,7 +177,12 @@ async def test_two_process_smoke(tmp_path):
 
             invalid_json_outbox = await agent_a.call_tool(
                 "sync",
-                {"topic_id": topic_id, "outbox": "not json", "wait_seconds": 0},
+                {
+                    "topic_id": topic_id,
+                    "agent_name": "red-squirrel",
+                    "outbox": "not json",
+                    "wait_seconds": 0,
+                },
             )
             assert invalid_json_outbox.isError is True
 
@@ -192,6 +199,7 @@ async def test_two_process_smoke(tmp_path):
                 "sync",
                 {
                     "topic_id": topic_id,
+                    "agent_name": "crimson-cat",
                     "outbox": [
                         {
                             "content_markdown": "world",
@@ -202,12 +210,13 @@ async def test_two_process_smoke(tmp_path):
                     "wait_seconds": 0,
                 },
             )
+
             assert reply.isError is False
             assert reply.structuredContent["sent"][0]["message"]["sender"] == "crimson-cat"
 
             received = await agent_a.call_tool(
                 "sync",
-                {"topic_id": topic_id, "wait_seconds": 0},
+                {"topic_id": topic_id, "agent_name": "red-squirrel", "wait_seconds": 0},
             )
             assert received.isError is False
             assert received.structuredContent["status"] == "ready"
@@ -215,13 +224,15 @@ async def test_two_process_smoke(tmp_path):
             assert received.structuredContent["received"][0]["sender"] == "crimson-cat"
             assert received.structuredContent["received"][0]["content_markdown"] == "world"
 
-            reset = await agent_a.call_tool("cursor_reset", {"topic_id": topic_id})
+            reset = await agent_a.call_tool(
+                "cursor_reset", {"topic_id": topic_id, "agent_name": "red-squirrel"}
+            )
             assert reset.isError is False
             assert reset.structuredContent["cursor"]["last_seq"] == 0
 
             replayed = await agent_a.call_tool(
                 "sync",
-                {"topic_id": topic_id, "wait_seconds": 0},
+                {"topic_id": topic_id, "agent_name": "red-squirrel", "wait_seconds": 0},
             )
             assert replayed.isError is False
             assert replayed.structuredContent["status"] == "ready"
@@ -264,7 +275,9 @@ async def test_sync_schema_respects_configured_max_items(tmp_path):
         joined = await peer.call_tool("topic_join", {"agent_name": "peer", "topic_id": topic_id})
         assert joined.isError is False
 
-        synced = await peer.call_tool("sync", {"topic_id": topic_id, "wait_seconds": 0})
+        synced = await peer.call_tool(
+            "sync", {"topic_id": topic_id, "agent_name": "peer", "wait_seconds": 0}
+        )
         assert synced.isError is False
         assert synced.structuredContent["received_count"] == 0
 
@@ -308,6 +321,7 @@ async def test_sync_schema_keeps_default_20_when_cap_is_higher(tmp_path):
                 "sync",
                 {
                     "topic_id": topic_id,
+                    "agent_name": "peer",
                     "outbox": [{"content_markdown": f"msg-{i}", "message_type": "message"}],
                     "wait_seconds": 0,
                 },
@@ -325,7 +339,9 @@ async def test_sync_schema_keeps_default_20_when_cap_is_higher(tmp_path):
             )
             assert joined_b.isError is False
 
-            replayed = await peer_b.call_tool("sync", {"topic_id": topic_id, "wait_seconds": 0})
+            replayed = await peer_b.call_tool(
+                "sync", {"topic_id": topic_id, "agent_name": "peer-b", "wait_seconds": 0}
+            )
             assert replayed.isError is False
             assert replayed.structuredContent["received_count"] == 20
             assert replayed.structuredContent["has_more"] is True
@@ -363,6 +379,7 @@ async def test_topic_join_rejects_duplicates_and_supports_reclaim(tmp_path):
             "sync",
             {
                 "topic_id": topic_id,
+                "agent_name": "codex",
                 "outbox": [{"content_markdown": "hello from codex", "message_type": "message"}],
                 "wait_seconds": 0,
             },
@@ -397,6 +414,7 @@ async def test_topic_join_rejects_duplicates_and_supports_reclaim(tmp_path):
             "sync",
             {
                 "topic_id": topic_id,
+                "agent_name": "codex reviewer",
                 "outbox": [{"content_markdown": "hello from reviewer", "message_type": "message"}],
                 "wait_seconds": 0,
             },
@@ -428,7 +446,7 @@ async def test_topic_join_rejects_duplicates_and_supports_reclaim(tmp_path):
 
         received = await agent_c.call_tool(
             "sync",
-            {"topic_id": topic_id, "wait_seconds": 0},
+            {"topic_id": topic_id, "agent_name": "codex", "wait_seconds": 0},
         )
         assert received.isError is False
         assert received.structuredContent["received_count"] == 1

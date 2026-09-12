@@ -4,7 +4,6 @@ import asyncio
 import contextlib
 import time
 import unicodedata
-from dataclasses import dataclass
 from typing import Annotated, Any, Literal, cast
 
 from mcp.server.fastmcp import FastMCP
@@ -90,7 +89,7 @@ mcp = FastMCP(
         "Join a topic with topic_join(agent_name=..., topic_id=...|name=...), then use sync() to "
         f"read/write messages. Use small max_items (<= {MAX_SYNC_ITEMS_LIMIT}) and call sync "
         "repeatedly until has_more is false. If you need to replay history, call "
-        "cursor_reset(topic_id=..., last_seq=0). "
+        "cursor_reset(agent_name=..., topic_id=..., last_seq=0). "
         "Read messages from structuredContent.received[*].content_markdown. Some MCP clients do "
         "not expose structuredContent. In that case, use the sync() text output (it includes "
         "message bodies and may be truncated). Outbox items require "
@@ -101,30 +100,6 @@ mcp = FastMCP(
     transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
     json_response=True,
 )
-
-
-@dataclass(frozen=True, slots=True)
-class JoinedIdentity:
-    agent_name: str
-    reclaim_token: str
-
-
-# In-memory (per server process) mapping of joined topic_id -> agent identity.
-# This is intentionally ephemeral: clients must call topic_join() again after a server restart.
-_joined_identities: dict[str, JoinedIdentity] = {}
-
-
-def _session_key(topic_id: str) -> str:
-    try:
-        ctx = mcp.get_context()
-        session_id = getattr(ctx, "client_id", None) or (
-            str(id(ctx.session)) if getattr(ctx, "session", None) is not None else None
-        )
-        if session_id:
-            return f"{session_id}:{topic_id}"
-    except (LookupError, ValueError, AttributeError):
-        pass
-    return topic_id
 
 
 def _normalize_agent_name(agent_name: str) -> str:
@@ -140,11 +115,6 @@ def _validate_agent_name(agent_name: object) -> str | None:
     if any(unicodedata.category(c) == "Cc" for c in normalized):
         return "agent_name must not contain control characters"
     return None
-
-
-def _agent_name_for_topic(topic_id: str) -> str | None:
-    identity = _joined_identities.get(_session_key(topic_id)) or _joined_identities.get(topic_id)
-    return identity.agent_name if identity is not None else None
 
 
 def _current_auth() -> AuthIdentity | None:
@@ -566,9 +536,8 @@ def topic_join(
         ),
     ] = None,
 ) -> Annotated[CallToolResult, TopicJoinOutput]:
-    """Join a topic as a named peer (in-memory per server process).
+    """Join a topic as a named peer.
 
-    Requires joining before calling `sync()`.
     Exactly one of `topic_id` or `name` must be provided.
     """
     err = _validate_agent_name(agent_name)
@@ -618,42 +587,31 @@ def topic_join(
         return tool_error(code=ErrorCode.DB_BUSY, message="Database is busy.")
 
     normalized = _normalize_agent_name(agent_name)
-    s_key = _session_key(topic.topic_id)
-    existing = _joined_identities.get(s_key) or _joined_identities.get(topic.topic_id)
-    if existing is not None and existing.agent_name == normalized:
-        reclaim = existing.reclaim_token
-    else:
-        try:
-            normalized, reclaim = db.reserve_agent_name(
-                topic_id=topic.topic_id,
-                agent_name=normalized,
-                reclaim_token=reclaim_token,
-            )
-        except SchemaMismatchError as e:
-            return _schema_mismatch_result(e)
-        except TopicNotFoundError:
-            return tool_error(code=ErrorCode.TOPIC_NOT_FOUND, message="Topic not found.")
-        except DBBusyError:
-            return tool_error(code=ErrorCode.DB_BUSY, message="Database is busy.")
-        except AgentNameInUseError:
-            return tool_error(
-                code=ErrorCode.AGENT_NAME_IN_USE,
-                message=(
-                    f'agent_name "{normalized}" is already reserved for this topic. '
-                    "Provide the original reclaim_token to reuse it, or choose a different "
-                    "agent_name."
-                ),
-                structured={
-                    "requested_agent_name": normalized,
-                    "suggested_agent_names": _suggest_agent_names(normalized),
-                },
-            )
-        identity = JoinedIdentity(
+    try:
+        normalized, reclaim = db.reserve_agent_name(
+            topic_id=topic.topic_id,
             agent_name=normalized,
-            reclaim_token=reclaim,
+            reclaim_token=reclaim_token,
         )
-        _joined_identities[s_key] = identity
-        _joined_identities[topic.topic_id] = identity
+    except SchemaMismatchError as e:
+        return _schema_mismatch_result(e)
+    except TopicNotFoundError:
+        return tool_error(code=ErrorCode.TOPIC_NOT_FOUND, message="Topic not found.")
+    except DBBusyError:
+        return tool_error(code=ErrorCode.DB_BUSY, message="Database is busy.")
+    except AgentNameInUseError:
+        return tool_error(
+            code=ErrorCode.AGENT_NAME_IN_USE,
+            message=(
+                f'agent_name "{normalized}" is already reserved for this topic. '
+                "Provide the original reclaim_token to reuse it, or choose a different "
+                "agent_name."
+            ),
+            structured={
+                "requested_agent_name": normalized,
+                "suggested_agent_names": _suggest_agent_names(normalized),
+            },
+        )
 
     text = (
         f'Joined topic "{topic.name}" ({topic.topic_id}) as "{normalized}".\n'
@@ -737,7 +695,7 @@ def topic_presence(
 
 @mcp.tool(description="Reset/set the server-side cursor for the joined peer on a topic.")
 def cursor_reset(
-    topic_id: str, *, agent_name: str | None = None, last_seq: int = 0
+    topic_id: str, *, agent_name: str, last_seq: int = 0
 ) -> Annotated[CallToolResult, CursorResetOutput]:
     """Reset/set the server-side cursor for this peer on a topic.
 
@@ -748,19 +706,10 @@ def cursor_reset(
             code=ErrorCode.INVALID_ARGUMENT, message="topic_id must be a non-empty string"
         )
 
-    if agent_name is None:
-        agent_name = _agent_name_for_topic(topic_id)
-    else:
-        err = _validate_agent_name(agent_name)
-        if err:
-            return tool_error(code=ErrorCode.INVALID_ARGUMENT, message=err)
-        agent_name = agent_name.strip()
-
-    if agent_name is None:
-        return tool_error(
-            code=ErrorCode.AGENT_NOT_JOINED,
-            message="Not joined to topic. Call topic_join() first or pass agent_name.",
-        )
+    err = _validate_agent_name(agent_name)
+    if err:
+        return tool_error(code=ErrorCode.INVALID_ARGUMENT, message=err)
+    agent_name = agent_name.strip()
 
     if not isinstance(last_seq, int) or last_seq < 0:
         return tool_error(code=ErrorCode.INVALID_ARGUMENT, message="last_seq must be an int >= 0")
@@ -768,6 +717,12 @@ def cursor_reset(
     err = _topic_access_error(topic_id)
     if err is not None:
         return err
+
+    if not db.is_joined(topic_id=topic_id, agent_name=agent_name):
+        return tool_error(
+            code=ErrorCode.AGENT_NOT_JOINED,
+            message="Not joined to topic. Call topic_join() first.",
+        )
 
     try:
         cursor = db.cursor_set(topic_id=topic_id, agent_name=agent_name, last_seq=last_seq)
@@ -801,11 +756,11 @@ async def sync(
     topic_id: str,
     *,
     agent_name: Annotated[
-        str | None,
+        str,
         Field(
-            description="Your agent name. If omitted, uses the identity registered via topic_join().",
+            description="Your agent name.",
         ),
-    ] = None,
+    ],
     outbox: Annotated[
         list[dict[str, Any]] | dict[str, Any] | str | None,
         Field(
@@ -843,10 +798,7 @@ async def sync(
     auto_advance: bool = True,
     ack_through: int | None = None,
 ) -> Annotated[CallToolResult, SyncOutput]:
-    """Read/write sync against a topic message stream.
-
-    Requires joining the topic first via `topic_join()`.
-    """
+    """Read/write sync against a topic message stream."""
     if not isinstance(topic_id, str) or not topic_id:
         return tool_error(
             code=ErrorCode.INVALID_ARGUMENT, message="topic_id must be a non-empty string"
@@ -856,18 +808,15 @@ async def sync(
     if err is not None:
         return err
 
-    if agent_name is None:
-        agent_name = _agent_name_for_topic(topic_id)
-    else:
-        err = _validate_agent_name(agent_name)
-        if err:
-            return tool_error(code=ErrorCode.INVALID_ARGUMENT, message=err)
-        agent_name = agent_name.strip()
+    err = _validate_agent_name(agent_name)
+    if err:
+        return tool_error(code=ErrorCode.INVALID_ARGUMENT, message=err)
+    agent_name = agent_name.strip()
 
-    if agent_name is None:
+    if not db.is_joined(topic_id=topic_id, agent_name=agent_name):
         return tool_error(
             code=ErrorCode.AGENT_NOT_JOINED,
-            message="Not joined to topic. Call topic_join() first or pass agent_name.",
+            message="Not joined to topic. Call topic_join() first.",
         )
 
     if outbox is None:
@@ -1242,11 +1191,15 @@ def chair_mute(
     if not chair:
         return tool_error(code=ErrorCode.INVALID_ARGUMENT, message="Topic is not chaired.")
     if caller.strip() != chair:
-        return tool_error(code=ErrorCode.NOT_CHAIR, message=f"Only the chair ({chair}) may mute peers.")
+        return tool_error(
+            code=ErrorCode.NOT_CHAIR, message=f"Only the chair ({chair}) may mute peers."
+        )
 
     target_name = target.strip()
     if not target_name:
-        return tool_error(code=ErrorCode.INVALID_ARGUMENT, message="target must be a non-empty string.")
+        return tool_error(
+            code=ErrorCode.INVALID_ARGUMENT, message="target must be a non-empty string."
+        )
     if target_name == chair:
         return tool_error(code=ErrorCode.INVALID_ARGUMENT, message="The chair cannot be muted.")
 
@@ -1306,11 +1259,15 @@ def chair_unmute(
     if not chair:
         return tool_error(code=ErrorCode.INVALID_ARGUMENT, message="Topic is not chaired.")
     if caller.strip() != chair:
-        return tool_error(code=ErrorCode.NOT_CHAIR, message=f"Only the chair ({chair}) may unmute peers.")
+        return tool_error(
+            code=ErrorCode.NOT_CHAIR, message=f"Only the chair ({chair}) may unmute peers."
+        )
 
     target_name = target.strip()
     if not target_name:
-        return tool_error(code=ErrorCode.INVALID_ARGUMENT, message="target must be a non-empty string.")
+        return tool_error(
+            code=ErrorCode.INVALID_ARGUMENT, message="target must be a non-empty string."
+        )
 
     muted = [m for m in (meta.get("muted") or []) if m != target_name]
     meta["muted"] = muted
@@ -1374,20 +1331,28 @@ def poll_open(
     if not chair:
         return tool_error(code=ErrorCode.INVALID_ARGUMENT, message="Topic is not chaired.")
     if caller.strip() != chair:
-        return tool_error(code=ErrorCode.NOT_CHAIR, message=f"Only the chair ({chair}) may open a poll.")
+        return tool_error(
+            code=ErrorCode.NOT_CHAIR, message=f"Only the chair ({chair}) may open a poll."
+        )
 
     q = question.strip()
     if not q:
-        return tool_error(code=ErrorCode.INVALID_ARGUMENT, message="question must be a non-empty string.")
+        return tool_error(
+            code=ErrorCode.INVALID_ARGUMENT, message="question must be a non-empty string."
+        )
 
     opts = options if options is not None else ["yay", "nay", "abstain"]
     if not isinstance(opts, list) or len(opts) < 2:
-        return tool_error(code=ErrorCode.INVALID_ARGUMENT, message="options must contain at least 2 choices.")
+        return tool_error(
+            code=ErrorCode.INVALID_ARGUMENT, message="options must contain at least 2 choices."
+        )
     if len(set(opts)) != len(opts):
         return tool_error(code=ErrorCode.INVALID_ARGUMENT, message="options must be unique.")
     for opt in opts:
         if not isinstance(opt, str) or not opt.strip():
-            return tool_error(code=ErrorCode.INVALID_ARGUMENT, message="each option must be a non-empty string.")
+            return tool_error(
+                code=ErrorCode.INVALID_ARGUMENT, message="each option must be a non-empty string."
+            )
 
     if threshold not in ("majority", "two-thirds", "plurality"):
         return tool_error(
@@ -1418,11 +1383,13 @@ def poll_open(
         db.sync_once(
             topic_id=topic_id,
             agent_name=caller.strip(),
-            outbox=[{
-                "content_markdown": announcement,
-                "message_type": "system",
-                "metadata": {"poll_id": poll_id, "options": opts, "threshold": threshold},
-            }],
+            outbox=[
+                {
+                    "content_markdown": announcement,
+                    "message_type": "system",
+                    "metadata": {"poll_id": poll_id, "options": opts, "threshold": threshold},
+                }
+            ],
             max_items=0,
             include_self=False,
             auto_advance=False,
@@ -1455,10 +1422,14 @@ def poll_vote(
     """Cast a vote in an open poll."""
     caller_name = caller.strip()
     if not caller_name:
-        return tool_error(code=ErrorCode.INVALID_ARGUMENT, message="caller must be a non-empty string.")
+        return tool_error(
+            code=ErrorCode.INVALID_ARGUMENT, message="caller must be a non-empty string."
+        )
     choice_val = choice.strip()
     if not choice_val:
-        return tool_error(code=ErrorCode.INVALID_ARGUMENT, message="choice must be a non-empty string.")
+        return tool_error(
+            code=ErrorCode.INVALID_ARGUMENT, message="choice must be a non-empty string."
+        )
 
     try:
         db.poll_vote(poll_id=poll_id, caller=caller_name, choice=choice_val)
@@ -1512,7 +1483,9 @@ def poll_close(
     if not chair:
         return tool_error(code=ErrorCode.INVALID_ARGUMENT, message="Topic is not chaired.")
     if caller.strip() != chair:
-        return tool_error(code=ErrorCode.NOT_CHAIR, message=f"Only the chair ({chair}) may close this poll.")
+        return tool_error(
+            code=ErrorCode.NOT_CHAIR, message=f"Only the chair ({chair}) may close this poll."
+        )
 
     try:
         result = db.poll_close(poll_id=poll_id)
@@ -1558,7 +1531,8 @@ def poll_status(poll_id: str) -> Annotated[CallToolResult, PollStatusOutput]:
     lines = [
         f"Poll: id={poll_id} status={poll_data['status']} threshold={poll_data['threshold']}",
         f"Question: {poll_data['question']}",
-        f"Tally ({total_votes} votes): " + " / ".join(f"{opt} {tally.get(opt, 0)}" for opt in options),
+        f"Tally ({total_votes} votes): "
+        + " / ".join(f"{opt} {tally.get(opt, 0)}" for opt in options),
     ]
 
     return tool_ok(

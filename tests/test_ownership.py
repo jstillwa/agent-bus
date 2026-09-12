@@ -33,6 +33,7 @@ def err_code(result) -> str:
 def post(db: AgentBusDB, topic_id: str, text: str, agent: str = "a") -> None:
     import asyncio
 
+    peer_server.topic_join(agent_name=agent, topic_id=topic_id)
     result = asyncio.run(
         peer_server.sync(
             topic_id,

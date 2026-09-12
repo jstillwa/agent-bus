@@ -69,7 +69,8 @@ def test_api_key_header_passes(client: TestClient, store: TokenStore) -> None:
 
 def test_cookie_passes(client: TestClient, store: TokenStore) -> None:
     _, raw = minted(store)
-    res = client.get("/api/me", cookies={"agent_bus_token": raw})
+    client.cookies.set("agent_bus_token", raw)
+    res = client.get("/api/me")
     assert res.status_code == 200
 
 
