@@ -1,8 +1,8 @@
-import pytest
-from mcp.client.stdio import stdio_client, StdioServerParameters
-from mcp.client.session import ClientSession
 import os
-import sys
+
+import pytest
+from mcp.client.session import ClientSession
+from mcp.client.stdio import StdioServerParameters, stdio_client
 
 
 def _bin(name: str) -> str:

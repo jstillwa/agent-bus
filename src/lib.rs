@@ -2588,6 +2588,7 @@ impl CoreDb {
         Ok(topic_to_dict(py, &updated))
     }
 
+    #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (topic_id, question, options_json, threshold="majority".to_string(), created_by="system".to_string(), poll_id=None))]
     fn poll_create(
         &self,
@@ -2665,6 +2666,7 @@ impl CoreDb {
         Ok(dict.into())
     }
 
+    #[allow(clippy::type_complexity)]
     fn poll_get(&self, py: Python<'_>, poll_id: String) -> PyResult<Option<Py<PyAny>>> {
         let conn = self.connect()?;
         let poll_row: Option<(
@@ -2994,7 +2996,7 @@ impl CoreDb {
                     .filter(|o| !o.eq_ignore_ascii_case("abstain"))
                     .map(|o| (o, tally.get(o).copied().unwrap_or(0)))
                     .collect();
-                candidates.sort_by(|a, b| b.1.cmp(&a.1));
+                candidates.sort_by_key(|a| std::cmp::Reverse(a.1));
 
                 let top_count = candidates[0].1;
                 let tie = candidates.len() > 1 && candidates[1].1 == top_count;

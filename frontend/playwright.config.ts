@@ -17,7 +17,7 @@ export default defineConfig({
       "pnpm build && rm -f .playwright-agent-bus.sqlite* && " +
       "uv run --project .. python ../tests/fixtures/seed_web_ui_db.py .playwright-agent-bus.sqlite && " +
       "uv run --project .. agent-bus serve --host 127.0.0.1 --port 4173 --db-path .playwright-agent-bus.sqlite",
-    url: "http://127.0.0.1:4173",
+    url: "http://127.0.0.1:4173/health",
     reuseExistingServer: !process.env.CI,
     timeout: 120_000,
   },
