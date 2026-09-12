@@ -2665,13 +2665,19 @@ impl CoreDb {
         Ok(dict.into())
     }
 
-    fn poll_get(
-        &self,
-        py: Python<'_>,
-        poll_id: String,
-    ) -> PyResult<Option<Py<PyAny>>> {
+    fn poll_get(&self, py: Python<'_>, poll_id: String) -> PyResult<Option<Py<PyAny>>> {
         let conn = self.connect()?;
-        let poll_row: Option<(String, String, String, String, String, String, String, f64, Option<f64>)> = conn
+        let poll_row: Option<(
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            f64,
+            Option<f64>,
+        )> = conn
             .query_row(
                 "
                 SELECT
@@ -2681,12 +2687,35 @@ impl CoreDb {
                 WHERE poll_id = ?
                 ",
                 params![&poll_id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?)),
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                        r.get(7)?,
+                        r.get(8)?,
+                    ))
+                },
             )
             .optional()
             .map_err(map_db_error)?;
 
-        let Some((pid, topic_id, question, options_json, threshold, status, created_by, created_at, closed_at)) = poll_row else {
+        let Some((
+            pid,
+            topic_id,
+            question,
+            options_json,
+            threshold,
+            status,
+            created_by,
+            created_at,
+            closed_at,
+        )) = poll_row
+        else {
             return Ok(None);
         };
 
@@ -2694,7 +2723,13 @@ impl CoreDb {
             .prepare("SELECT agent_name, choice, updated_at FROM poll_votes WHERE poll_id = ? ORDER BY updated_at ASC")
             .map_err(map_db_error)?;
         let votes = stmt
-            .query_map(params![&pid], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, f64>(2)?)))
+            .query_map(params![&pid], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, f64>(2)?,
+                ))
+            })
             .map_err(map_db_error)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(map_db_error)?;
@@ -2712,7 +2747,14 @@ impl CoreDb {
 
         let votes_list = PyList::empty(py);
         for (agent_name, choice, updated_at) in &votes {
-            let t = PyTuple::new(py, &[agent_name.into_py_any(py)?, choice.into_py_any(py)?, updated_at.into_py_any(py)?])?;
+            let t = PyTuple::new(
+                py,
+                &[
+                    agent_name.into_py_any(py)?,
+                    choice.into_py_any(py)?,
+                    updated_at.into_py_any(py)?,
+                ],
+            )?;
             votes_list.append(t)?;
         }
         dict.set_item("votes", votes_list)?;
@@ -2741,11 +2783,15 @@ impl CoreDb {
             .map_err(map_db_error)?;
 
         let Some((topic_id, options_json, status)) = poll_row else {
-            return Err(PollNotFoundError::new_err(format!("Poll '{poll_id}' not found.")));
+            return Err(PollNotFoundError::new_err(format!(
+                "Poll '{poll_id}' not found."
+            )));
         };
 
         if status != "open" {
-            return Err(PollClosedError::new_err(format!("Poll '{poll_id}' is closed (status: {status}).")));
+            return Err(PollClosedError::new_err(format!(
+                "Poll '{poll_id}' is closed (status: {status})."
+            )));
         }
 
         let is_joined: bool = tx
@@ -2802,11 +2848,7 @@ impl CoreDb {
         Ok(dict.into())
     }
 
-    fn poll_close(
-        &self,
-        py: Python<'_>,
-        poll_id: String,
-    ) -> PyResult<Py<PyAny>> {
+    fn poll_close(&self, py: Python<'_>, poll_id: String) -> PyResult<Py<PyAny>> {
         let closed_at = now();
         let mut conn = self.connect()?;
         let tx = conn.transaction().map_err(map_db_error)?;
@@ -2819,17 +2861,33 @@ impl CoreDb {
                 WHERE poll_id = ?
                 ",
                 params![&poll_id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)),
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                    ))
+                },
             )
             .optional()
             .map_err(map_db_error)?;
 
-        let Some((topic_id, question, options_json, threshold, status, created_by, created_at)) = poll_row else {
-            return Err(PollNotFoundError::new_err(format!("Poll '{poll_id}' not found.")));
+        let Some((topic_id, question, options_json, threshold, status, created_by, created_at)) =
+            poll_row
+        else {
+            return Err(PollNotFoundError::new_err(format!(
+                "Poll '{poll_id}' not found."
+            )));
         };
 
         if status != "open" {
-            return Err(PollClosedError::new_err(format!("Poll '{poll_id}' is closed (status: {status}).")));
+            return Err(PollClosedError::new_err(format!(
+                "Poll '{poll_id}' is closed (status: {status})."
+            )));
         }
 
         tx.execute(
@@ -2839,8 +2897,11 @@ impl CoreDb {
         .map_err(map_db_error)?;
 
         let options: Vec<String> = {
-            let mut stmt = tx.prepare("SELECT value FROM json_each(?)").map_err(map_db_error)?;
-            let rows = stmt.query_map(params![&options_json], |r| r.get(0))
+            let mut stmt = tx
+                .prepare("SELECT value FROM json_each(?)")
+                .map_err(map_db_error)?;
+            let rows = stmt
+                .query_map(params![&options_json], |r| r.get(0))
                 .map_err(map_db_error)?
                 .collect::<Result<Vec<String>, _>>()
                 .map_err(map_db_error)?;
@@ -2943,7 +3004,9 @@ impl CoreDb {
                 } else {
                     match threshold.as_str() {
                         "two-thirds" => {
-                            if (top_count as f64) / (non_abstain_total as f64) >= (2.0 / 3.0 - 0.00001) {
+                            if (top_count as f64) / (non_abstain_total as f64)
+                                >= (2.0 / 3.0 - 0.00001)
+                            {
                                 "ADOPTED"
                             } else {
                                 "DEADLOCKED"
