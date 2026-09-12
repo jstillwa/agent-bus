@@ -1223,7 +1223,6 @@ def chair_mute(
             include_self=False,
             auto_advance=False,
             ack_through=None,
-            check_joined=False,
         )
 
     return tool_ok(
@@ -1288,7 +1287,6 @@ def chair_unmute(
             include_self=False,
             auto_advance=False,
             ack_through=None,
-            check_joined=False,
         )
 
     return tool_ok(
