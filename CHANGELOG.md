@@ -2,6 +2,25 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.0] - 2026-09-12
+
+### Changed
+
+- **Breaking**: `agent_name` is now a required parameter on `sync()` and `cursor_reset()`.
+  Removed insecure in-memory `_joined_identities` session fallbacks that caused ambient
+  identity cross-talk and silent message suppression under multi-agent HTTP deployments.
+- **Breaking**: Removed `topic_join` cached-token fast-path. Rejoining a topic with the same
+  `agent_name` now strictly requires providing the original `reclaim_token` to prevent
+  token disclosure across sessions.
+
+### Fixed
+
+- Added `AGENT_NOT_JOINED` membership check at the MCP tool boundary for `sync` and `cursor_reset`,
+  preventing phantom cursor creation while preserving unreserved write paths for the Web API.
+- Closed `reclaim_token` disclosure vulnerability where unauthorized re-joins could obtain
+  another session's token.
+- Updated spec and documentation to reflect durable SQLite reservations and mandatory `agent_name`.
+
 ## [0.5.2] - 2026-09-10
 
 ### Added

@@ -29,7 +29,9 @@ def test_schema_migration_v6_to_v7(tmp_path):
     # Seed a simulated v6 database
     with sqlite3.connect(db_path) as conn:
         conn.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
-        conn.execute("INSERT INTO meta (key, value) VALUES ('schema_version', '6'), ('topics_version', '0')")
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES ('schema_version', '6'), ('topics_version', '0')"
+        )
         conn.execute(
             """
             CREATE TABLE topics (
@@ -110,7 +112,10 @@ def test_schema_migration_v6_to_v7(tmp_path):
         assert version == "7"
 
         # Check that polls and poll_votes tables now exist
-        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+        tables = {
+            r[0]
+            for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+        }
         assert "polls" in tables
         assert "poll_votes" in tables
 
@@ -262,7 +267,13 @@ def test_db_poll_two_thirds_and_plurality(tmp_path):
         db.reserve_agent_name(topic_id=tid, agent_name=name)
 
     # Two-thirds test: 2 yay vs 1 nay (66.7% yay) -> ADOPTED
-    poll_23 = db.poll_create(topic_id=tid, question="Amend constitution?", options=["yay", "nay"], threshold="two-thirds", created_by="c")
+    poll_23 = db.poll_create(
+        topic_id=tid,
+        question="Amend constitution?",
+        options=["yay", "nay"],
+        threshold="two-thirds",
+        created_by="c",
+    )
     db.poll_vote(poll_id=poll_23["poll_id"], caller="p1", choice="yay")
     db.poll_vote(poll_id=poll_23["poll_id"], caller="p2", choice="yay")
     db.poll_vote(poll_id=poll_23["poll_id"], caller="p3", choice="nay")
@@ -270,7 +281,13 @@ def test_db_poll_two_thirds_and_plurality(tmp_path):
     assert res_23["verdict"] == "ADOPTED"
 
     # Multi-option plurality test
-    poll_multi = db.poll_create(topic_id=tid, question="Color?", options=["Red", "Green", "Blue"], threshold="plurality", created_by="c")
+    poll_multi = db.poll_create(
+        topic_id=tid,
+        question="Color?",
+        options=["Red", "Green", "Blue"],
+        threshold="plurality",
+        created_by="c",
+    )
     db.poll_vote(poll_id=poll_multi["poll_id"], caller="p1", choice="Blue")
     db.poll_vote(poll_id=poll_multi["poll_id"], caller="p2", choice="Blue")
     db.poll_vote(poll_id=poll_multi["poll_id"], caller="p3", choice="Red")
@@ -335,7 +352,9 @@ async def test_mcp_tools_chaired_topics_and_polls(tmp_path):
                 {
                     "topic_id": topic_id,
                     "agent_name": "associate-justice",
-                    "outbox": [{"content_markdown": "I have an argument", "message_type": "message"}],
+                    "outbox": [
+                        {"content_markdown": "I have an argument", "message_type": "message"}
+                    ],
                     "wait_seconds": 0,
                 },
             )
@@ -397,7 +416,9 @@ async def test_mcp_tools_chaired_topics_and_polls(tmp_path):
                 {
                     "topic_id": topic_id,
                     "agent_name": "associate-justice",
-                    "outbox": [{"content_markdown": "Back on the record.", "message_type": "message"}],
+                    "outbox": [
+                        {"content_markdown": "Back on the record.", "message_type": "message"}
+                    ],
                     "wait_seconds": 0,
                 },
             )
@@ -437,4 +458,7 @@ async def test_mcp_tools_chaired_topics_and_polls(tmp_path):
             )
             assert close_res.isError is False
             assert close_res.structuredContent["verdict"] == "ADOPTED"
-            assert "POLL CLOSED: Adopt the resolution?" in close_res.structuredContent["result_message"]
+            assert (
+                "POLL CLOSED: Adopt the resolution?"
+                in close_res.structuredContent["result_message"]
+            )

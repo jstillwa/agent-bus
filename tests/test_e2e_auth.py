@@ -7,12 +7,11 @@ regressions; this drives the full middleware -> MCP tool path.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
 
 import httpx
 import pytest
 from mcp.client.session import ClientSession
-from mcp.client.streamable_http import streamablehttp_client
+from mcp.client.streamable_http import streamable_http_client
 
 import agent_bus.peer_server as peer_server
 from agent_bus.db import AgentBusDB
@@ -52,17 +51,11 @@ async def test_mcp_over_http_enforces_ownership(tmp_path: Path, monkeypatch: pyt
 
         async def call_tools(raw: str, calls: list[tuple[str, dict]]):
             transport = httpx.ASGITransport(app=web_server.app)
-
-            def factory(**kwargs: Any) -> httpx.AsyncClient:
-                kwargs["headers"] = {
-                    **(kwargs.get("headers") or {}),
-                    "Authorization": f"Bearer {raw}",
-                }
-                kwargs.pop("auth", None)
-                return httpx.AsyncClient(transport=transport, **kwargs)
+            headers = {"Authorization": f"Bearer {raw}"}
 
             async with (
-                streamablehttp_client("http://testserver/mcp", httpx_client_factory=factory) as (
+                httpx.AsyncClient(transport=transport, headers=headers) as http_client,
+                streamable_http_client("http://testserver/mcp", http_client=http_client) as (
                     read,
                     write,
                     _get_session_id,

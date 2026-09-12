@@ -1885,6 +1885,24 @@ impl CoreDb {
         )))
     }
 
+    fn is_joined(&self, topic_id: String, agent_name: String) -> PyResult<bool> {
+        let conn = self.connect()?;
+        let is_joined: bool = conn
+            .query_row(
+                "
+                SELECT EXISTS(
+                  SELECT 1 FROM agent_name_reservations WHERE topic_id = ? AND agent_name = ?
+                  UNION
+                  SELECT 1 FROM cursors WHERE topic_id = ? AND agent_name = ?
+                )
+                ",
+                params![&topic_id, &agent_name, &topic_id, &agent_name],
+                |r| r.get(0),
+            )
+            .map_err(map_db_error)?;
+        Ok(is_joined)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn sync_once(
         &self,

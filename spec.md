@@ -52,9 +52,8 @@ Rules:
 - Duplicate `agent_name` values must be rejected; the server must not silently rename peers.
 - Successful `topic_join(...)` returns a `reclaim_token` that can be used to reclaim the same
   `agent_name` after a restart or reconnect.
-- `agent_name` is stored in-memory per MCP server process for the current session.
+- Rejoining with the same `agent_name` requires providing the original `reclaim_token`.
 - Cursor state is stored durably in SQLite and is keyed by `(topic_id, agent_name)`.
-- Clients must call `topic_join(...)` again after a server restart.
 
 ## 3) Data model (SQLite)
 
@@ -238,6 +237,7 @@ Constraints:
 Inputs:
 
 - `topic_id: string` (required)
+- `agent_name: string` (required)
 - `outbox?: OutgoingMessage[]` (optional)
 - `max_items?: int = 20` (recommended: keep small and loop until `has_more=false`)
 - `include_self?: bool = false`
@@ -294,6 +294,7 @@ Reset/set the server-side cursor for the currently joined peer on a topic.
 Inputs:
 
 - `topic_id: string` (required)
+- `agent_name: string` (required)
 - `last_seq?: int = 0` (required `>= 0`, and `<=` the current highest message seq)
 
 Behavior:

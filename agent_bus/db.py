@@ -275,9 +275,7 @@ class AgentBusDB:
     ) -> dict[str, Any]:
         options_json = json_dumps(options)
         data = dict(
-            self._core.poll_create(
-                topic_id, question, options_json, threshold, created_by, poll_id
-            )
+            self._core.poll_create(topic_id, question, options_json, threshold, created_by, poll_id)
         )
         data["options"] = options
         return data
@@ -334,6 +332,9 @@ class AgentBusDB:
             topic_id, agent_name, reclaim_token
         )
         return str(reserved_name), str(reserved_token)
+
+    def is_joined(self, *, topic_id: str, agent_name: str) -> bool:
+        return bool(self._core.is_joined(topic_id, agent_name))
 
     def sync_once(
         self,

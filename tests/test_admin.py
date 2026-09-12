@@ -41,13 +41,15 @@ def test_admin_page_requires_browser_admin(store, env) -> None:
         assert res.status_code in (302, 307)
         assert res.headers["location"] == "/auth/login?browser=1"
 
-        assert client.get("/admin", cookies={"agent_bus_token": cookie}).status_code == 200
-        assert "admin" in client.get("/admin", cookies={"agent_bus_token": cookie}).text.lower()
+        client.cookies.set("agent_bus_token", cookie)
+        assert client.get("/admin").status_code == 200
+        assert "admin" in client.get("/admin").text.lower()
         # admin group but MCP-minted -> forbidden
         res = client.get("/admin", headers={"Authorization": f"Bearer {mcp_admin}"})
         assert res.status_code == 403
         # browser session without admin group -> forbidden
-        assert client.get("/admin", cookies={"agent_bus_token": browser_pleb}).status_code == 403
+        client.cookies.set("agent_bus_token", browser_pleb)
+        assert client.get("/admin").status_code == 403
 
 
 def test_api_admin_still_requires_token(store, env) -> None:
@@ -65,7 +67,8 @@ def test_admin_tokens_list_has_no_hashes(store, env) -> None:
     cookie = browser_admin_cookie(store)
 
     with TestClient(web_server.app) as client:
-        res = client.get("/api/admin/tokens", cookies={"agent_bus_token": cookie})
+        client.cookies.set("agent_bus_token", cookie)
+        res = client.get("/api/admin/tokens")
     assert res.status_code == 200
     tokens = res.json()["tokens"]
     assert len(tokens) == 2
@@ -78,21 +81,18 @@ def test_revoke_via_cookie_needs_same_origin(store, env) -> None:
     victim_id, _ = store.mint(iss=ISS, sub="alice")
 
     with TestClient(web_server.app) as client:
-        no_origin = client.post(
-            f"/api/admin/tokens/{victim_id}/revoke", cookies={"agent_bus_token": cookie}
-        )
+        client.cookies.set("agent_bus_token", cookie)
+        no_origin = client.post(f"/api/admin/tokens/{victim_id}/revoke")
         assert no_origin.status_code == 403
 
         cross = client.post(
             f"/api/admin/tokens/{victim_id}/revoke",
-            cookies={"agent_bus_token": cookie},
             headers={"Origin": "https://evil.example"},
         )
         assert cross.status_code == 403
 
         ok = client.post(
             f"/api/admin/tokens/{victim_id}/revoke",
-            cookies={"agent_bus_token": cookie},
             headers={"Origin": ORIGIN},
         )
         assert ok.status_code == 200
