@@ -16,6 +16,7 @@ from agent_bus.db import (
     MutedError,
     PollClosedError,
     PollNotFoundError,
+    TopicClosedError,
 )
 
 
@@ -462,3 +463,161 @@ async def test_mcp_tools_chaired_topics_and_polls(tmp_path):
                 "POLL CLOSED: Adopt the resolution?"
                 in close_res.structuredContent["result_message"]
             )
+
+
+def test_db_mute_enforced_without_a_chair(tmp_path):
+    """Owner moderation must work on topics with no chair; the gate cannot require one."""
+    db = AgentBusDB(path=str(tmp_path / "unchaired.sqlite"))
+    topic = db.topic_create(name="unchaired", metadata={"muted": ["noisy"]}, mode="new")
+    topic_id = topic.topic_id
+
+    with pytest.raises(MutedError):
+        db.sync_once(
+            topic_id=topic_id,
+            agent_name="noisy",
+            outbox=[{"content_markdown": "let me in", "message_type": "message"}],
+            max_items=10,
+            include_self=False,
+            auto_advance=True,
+            ack_through=None,
+        )
+
+    # A muted peer keeps read access.
+    _, received, _cursor, _ = db.sync_once(
+        topic_id=topic_id,
+        agent_name="noisy",
+        outbox=[],
+        max_items=10,
+        include_self=False,
+        auto_advance=True,
+        ack_through=None,
+    )
+    assert received == []
+
+    # Clearing the mute restores posting.
+    db.topic_update_metadata(topic_id=topic_id, metadata={"muted": []})
+    sent, _, _, _ = db.sync_once(
+        topic_id=topic_id,
+        agent_name="noisy",
+        outbox=[{"content_markdown": "back", "message_type": "message"}],
+        max_items=10,
+        include_self=False,
+        auto_advance=True,
+        ack_through=None,
+    )
+    assert len(sent) == 1
+
+
+def test_db_reopen_restores_writes_and_keeps_history(tmp_path):
+    db = AgentBusDB(path=str(tmp_path / "reopen.sqlite"))
+    topic = db.topic_create(name="cycle", mode="new", metadata={})
+    topic_id = topic.topic_id
+
+    db.sync_once(
+        topic_id=topic_id,
+        agent_name="author",
+        outbox=[{"content_markdown": "before", "message_type": "message"}],
+        max_items=0,
+        include_self=False,
+        auto_advance=True,
+        ack_through=None,
+    )
+    closed, already_closed = db.topic_close(topic_id=topic_id, reason="done")
+    assert closed.status == "closed"
+    assert already_closed is False
+    assert closed.close_reason == "done"
+
+    # Reads still work while closed, and the existing history is intact.
+    _, received, _cursor, _ = db.sync_once(
+        topic_id=topic_id,
+        agent_name="reader",
+        outbox=[],
+        max_items=10,
+        include_self=False,
+        auto_advance=True,
+        ack_through=None,
+    )
+    assert [m.content_markdown for m in received] == ["before"]
+
+    # Writes are rejected while closed.
+    with pytest.raises(TopicClosedError):
+        db.sync_once(
+            topic_id=topic_id,
+            agent_name="author",
+            outbox=[{"content_markdown": "nope", "message_type": "message"}],
+            max_items=0,
+            include_self=False,
+            auto_advance=True,
+            ack_through=None,
+        )
+
+    reopened, reopened_now = db.topic_reopen(topic_id=topic_id)
+    assert reopened.status == "open"
+    assert reopened_now is True
+    assert reopened.closed_at is None
+    assert reopened.close_reason is None
+
+    # Writes work again and history is preserved.
+    sent, _, _, _ = db.sync_once(
+        topic_id=topic_id,
+        agent_name="author",
+        outbox=[{"content_markdown": "after", "message_type": "message"}],
+        max_items=0,
+        include_self=False,
+        auto_advance=True,
+        ack_through=None,
+    )
+    assert len(sent) == 1
+
+    # Reopen is idempotent.
+    again, again_now = db.topic_reopen(topic_id=topic_id)
+    assert again.status == "open"
+    assert again_now is False
+
+
+@pytest.mark.anyio
+async def test_mcp_reopen_and_set_rate_limit(tmp_path):
+    db_path = str(tmp_path / "tools.sqlite")
+    env = {**os.environ, "AGENT_BUS_DB": db_path, "AGENT_BUS_EMBEDDINGS_AUTOINDEX": "0"}
+    peer_server = StdioServerParameters(command=_bin("agent-bus"), env=env)
+
+    async with (
+        stdio_client(peer_server) as (c_read, c_write),
+        ClientSession(c_read, c_write) as client,
+    ):
+        await client.initialize()
+
+        tools = await client.list_tools()
+        tool_names = {t.name for t in tools.tools}
+        assert "topic_reopen" in tool_names
+        assert "set_rate_limit" in tool_names
+
+        created = await client.call_tool("topic_create", {"name": "cycle", "mode": "new"})
+        topic_id = created.structuredContent["topic_id"]
+
+        await client.call_tool("topic_join", {"agent_name": "chair", "topic_id": topic_id})
+
+        limit_res = await client.call_tool(
+            "set_rate_limit",
+            {"topic_id": topic_id, "caller": "chair", "rate_limit": 0.5},
+        )
+        assert limit_res.isError is False
+        assert limit_res.structuredContent["rate_limit"] == 0.5
+
+        # Reject out-of-range values.
+        bad = await client.call_tool(
+            "set_rate_limit",
+            {"topic_id": topic_id, "caller": "chair", "rate_limit": 1.5},
+        )
+        assert bad.isError is True
+        assert bad.structuredContent["error"]["code"] == ErrorCode.INVALID_ARGUMENT
+
+        closed = await client.call_tool(
+            "topic_close", {"topic_id": topic_id, "reason": "wrapped up"}
+        )
+        assert closed.isError is False
+
+        reopened = await client.call_tool("topic_reopen", {"topic_id": topic_id})
+        assert reopened.isError is False
+        assert reopened.structuredContent["status"] == "open"
+        assert reopened.structuredContent["reopened_now"] is True
