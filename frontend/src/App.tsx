@@ -1,4 +1,4 @@
-import { startTransition, useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from "react"
+import { startTransition, useCallback, useEffect, useEffectEvent, useMemo, useRef, useState, type CSSProperties } from "react"
 import ReactMarkdown, { type Components } from "react-markdown"
 import { useLocation, useNavigate } from "react-router-dom"
 import remarkGfm from "remark-gfm"
@@ -1102,16 +1102,21 @@ function TopicView(props: {
     return () => mediaQuery.removeEventListener("change", updateDesktopState)
   }, [])
 
-  const clearThreadMapHideTimer = useCallback(() => {
+  // Called only from timeline effects and their cleanups, so useEffectEvent applies without
+  // listing the timer refs as dependencies.
+  const clearThreadMapHideTimer = useEffectEvent(() => {
     if (threadMapHideTimerRef.current !== null) {
       window.clearTimeout(threadMapHideTimerRef.current)
       threadMapHideTimerRef.current = null
     }
     threadMapHideAtRef.current = 0
     threadMapHideTimerDueAtRef.current = 0
-  }, [])
+  })
 
-  const scheduleThreadMapHide = useCallback((delay = THREAD_MAP_AUTO_HIDE_MS) => {
+  // scheduleThreadMapHideNow and revealThreadMapNow run from timers, pointer handlers, and
+  // jumpToMessage, so they stay plain callbacks. The effect-only variants below wrap them for
+  // the effects, which must not re-subscribe when the captured state changes identity.
+  const scheduleThreadMapHideNow = useCallback((delay = THREAD_MAP_AUTO_HIDE_MS) => {
     if (typeof window === "undefined") {
       return
     }
@@ -1146,17 +1151,24 @@ function TopicView(props: {
     armTimer(delay)
   }, [])
 
-  const revealThreadMap = useCallback(
+  // revealThreadMapNow runs from timers, pointer handlers, and jumpToMessage, so it stays a
+  // plain callback. The effect-only variant below wraps it for the effects, which must not
+  // re-subscribe when isDesktopThreadMap or threadMapQualifies changes identity.
+  const revealThreadMapNow = useCallback(
     (delay = THREAD_MAP_AUTO_HIDE_MS) => {
       if (typeof window === "undefined" || !isDesktopThreadMap || !threadMapQualifies) {
         return
       }
 
       setThreadMapVisible(true)
-      scheduleThreadMapHide(delay)
+      scheduleThreadMapHideNow(delay)
     },
-    [isDesktopThreadMap, scheduleThreadMapHide, threadMapQualifies],
+    [isDesktopThreadMap, scheduleThreadMapHideNow, threadMapQualifies],
   )
+
+  const revealThreadMap = useEffectEvent((delay = THREAD_MAP_AUTO_HIDE_MS) => {
+    revealThreadMapNow(delay)
+  })
 
   useEffect(() => {
     if (!isDesktopThreadMap || !threadMapQualifies) {
@@ -1165,13 +1177,13 @@ function TopicView(props: {
     }
 
     return () => clearThreadMapHideTimer()
-  }, [clearThreadMapHideTimer, isDesktopThreadMap, threadMapQualifies])
+  }, [isDesktopThreadMap, threadMapQualifies])
 
   useEffect(() => {
     if (findState.open || activeFindMessageId || topicDetail.focus_message_id) {
       revealThreadMap()
     }
-  }, [activeFindMessageId, findState.open, isDesktopThreadMap, revealThreadMap, threadMapQualifies, topicDetail.focus_message_id])
+  }, [activeFindMessageId, findState.open, topicDetail.focus_message_id])
 
   useEffect(() => {
     if (!isDesktopThreadMap) {
@@ -1274,10 +1286,10 @@ function TopicView(props: {
         window.removeEventListener("resize", measureMarkers)
       }
     }
-  }, [isDesktopThreadMap, revealThreadMap, topicDetail.messages])
+  }, [isDesktopThreadMap, topicDetail.messages])
 
   function jumpToMessage(messageId: string) {
-    revealThreadMap()
+    revealThreadMapNow()
     const element = document.getElementById(`msg-${messageId}`)
     if (!element) {
       return
@@ -1291,7 +1303,7 @@ function TopicView(props: {
       return
     }
 
-    revealThreadMap()
+    revealThreadMapNow()
     viewport.scrollTop = clamp(top, 0, 1) * viewport.scrollHeight
     if (viewport.scrollHeight > 0) {
       const nextViewport = {
@@ -1428,12 +1440,12 @@ function TopicView(props: {
               className="relative flex min-h-0 flex-1 flex-col"
               onPointerMove={() => {
                 if (threadMapVisible) {
-                  revealThreadMap()
+                  revealThreadMapNow()
                 }
               }}
               onPointerLeave={() => {
                 if (threadMapVisible) {
-                  scheduleThreadMapHide(500)
+                  scheduleThreadMapHideNow(500)
                 }
               }}
             >
@@ -1442,8 +1454,8 @@ function TopicView(props: {
                   <div
                     data-ab-thread-map-hotspot="true"
                     className="absolute inset-y-0 right-0 z-10 w-10"
-                    onPointerEnter={() => revealThreadMap()}
-                    onPointerMove={() => revealThreadMap()}
+                    onPointerEnter={() => revealThreadMapNow()}
+                    onPointerMove={() => revealThreadMapNow()}
                   />
                   <ThreadMap
                     visible={threadMapVisible}
