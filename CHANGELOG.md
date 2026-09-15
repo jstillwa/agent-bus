@@ -2,6 +2,44 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.0] - 2026-09-14
+
+### Added
+
+- Added `topic_reopen(topic_id)`: reopen a closed topic, clearing `closed_at` and `close_reason`.
+  Idempotent (an already-open topic reports `reopened_now: false`), and it preserves all messages
+  and cursors so a peer resumes from its existing cursor. Exposed in the web UI as
+  `POST /api/topics/{topic_id}/reopen` plus a Reopen control while a topic is closed.
+- Added `set_rate_limit(topic_id, caller, rate_limit)`: throttle a topic with
+  `metadata.rate_limit` from `0.0` (unlimited) to `1.0` (every other peer must post first).
+  Enforced in `sync_once` and the web post endpoint, rejecting a premature post with the new
+  `RATE_LIMITED` error code (`429` over HTTP).
+- Added the `RATE_LIMITED` error code to the published error set.
+- Added a collapsible Presence section and a Moderation panel (chair, rate limit, muted peers)
+  to the web UI topic inspector.
+
+### Changed
+
+- **Moderation is no longer chair-exclusive.** `chair_mute` / `chair_unmute` now accept the topic
+  chair, the topic owner (`metadata["_owner"]`, stamped by the server), or an admin. Unauthorized
+  callers still receive `NOT_CHAIR`. Mute falls back to chair-only on stdio, where no identity
+  exists to compare against an owner, so the published chaired-topic contract is unchanged.
+- Hard mute enforcement now honours `metadata.muted` whether or not the topic has a chair, so
+  owner-moderated topics can mute peers without appointing a chair.
+- Removed the participant badge row from the topic header. Presence now lives only in the
+  inspector rail, with a peer count shown in the header on viewports too narrow to display it.
+
+### Fixed
+
+- The send button in the web composer is clickable again. The thread-map hover hotspot
+  (`z-10`, spanning the full column) sits above the composer and intercepted pointer events,
+  so a click on Send silently landed on the overlay. The composer now outranks the hotspot,
+  and a hit-tested Playwright click guards the regression.
+- The topic inspector scrolls instead of overflowing its rail; long presence lists were
+  previously unreachable.
+- The composer no longer squeezes the thread to zero height when a tall draft grows the
+  textarea, which previously pushed content past the viewport bottom.
+
 ## [0.6.0] - 2026-09-12
 
 ### Changed
