@@ -119,3 +119,9 @@ export interface CloseTopicResponse {
   topic: TopicSummary
   closed_now: boolean
 }
+
+export interface ReopenTopicResponse {
+  status: string
+  topic: TopicSummary
+  reopened_now: boolean
+}

@@ -1710,4 +1710,87 @@ describe("App", () => {
     await waitFor(() => expect(screen.queryByText("stale detail")).not.toBeInTheDocument())
     expect(screen.getByText("focused detail")).toBeInTheDocument()
   })
+
+  test("shows the inspector moderation state and collapses presence", async () => {
+    installFetchMock()
+    setDesktopWidth()
+
+    renderApp(["/topics/t-1"])
+
+    expect(await screen.findByText("Moderation")).toBeInTheDocument()
+    expect(screen.getByText("Rate limit:")).toBeInTheDocument()
+    expect(screen.getByText("unlimited")).toBeInTheDocument()
+    expect(screen.getByText("Muted (0)")).toBeInTheDocument()
+
+    // Presence starts expanded, and its trigger collapses it.
+    const presenceTrigger = screen.getByRole("button", { name: /Presence/i })
+    expect(await screen.findByText("codex reviewer")).toBeInTheDocument()
+    fireEvent.click(presenceTrigger)
+    await waitFor(() =>
+      expect(screen.queryByText("codex reviewer")).not.toBeInTheDocument()
+    )
+  })
+
+  test("surfaces a rate limit and muted peers from topic metadata", async () => {
+    const fetchSpy = installFetchMock()
+    fetchSpy.mockImplementation((input) => {
+      const url = new URL(String(input), "http://localhost")
+      if (url.pathname === "/api/topics") {
+        return jsonResponse(topicsPayload)
+      }
+      if (url.pathname === "/api/topics/t-1") {
+        const detail = topicDetail("t-1", "hello from alpha")
+        detail.topic = {
+          ...detail.topic,
+          metadata: { chair: "chief-justice", muted: ["noisy-peer"], rate_limit: 0.5 },
+        }
+        return jsonResponse(detail)
+      }
+      throw new Error(`Unhandled fetch ${url.pathname}${url.search}`)
+    })
+    setDesktopWidth()
+
+    renderApp(["/topics/t-1"])
+
+    expect(await screen.findByText("chief-justice")).toBeInTheDocument()
+    expect(screen.getByText(/0.5 of peers must post first/)).toBeInTheDocument()
+    expect(screen.getByText("Muted (1)")).toBeInTheDocument()
+    expect(screen.getByText("noisy-peer")).toBeInTheDocument()
+  })
+
+  test("offers a reopen action when the topic is closed", async () => {
+    const fetchSpy = installFetchMock()
+    let reopenCalled = false
+    fetchSpy.mockImplementation((input) => {
+      const url = new URL(String(input), "http://localhost")
+      if (url.pathname === "/api/topics/t-1/reopen") {
+        reopenCalled = true
+        const detail = topicDetail("t-1", "hello from alpha")
+        detail.topic = { ...detail.topic, status: "open", close_reason: null, closed_at: null }
+        return jsonResponse({ status: "ok", topic: detail.topic, reopened_now: true })
+      }
+      if (url.pathname === "/api/topics") {
+        return jsonResponse(topicsPayload)
+      }
+      if (url.pathname === "/api/topics/t-1") {
+        const detail = topicDetail("t-1", "hello from alpha")
+        detail.topic = {
+          ...detail.topic,
+          status: "closed",
+          close_reason: "wrapped up",
+        }
+        return jsonResponse(detail)
+      }
+      throw new Error(`Unhandled fetch ${url.pathname}${url.search}`)
+    })
+    setDesktopWidth()
+
+    renderApp(["/topics/t-1"])
+
+    const reopenButtons = await screen.findAllByRole("button", { name: /Reopen topic/i })
+    expect(reopenButtons.length).toBeGreaterThan(0)
+    fireEvent.click(reopenButtons[0])
+
+    await waitFor(() => expect(reopenCalled).toBe(true))
+  })
 })
