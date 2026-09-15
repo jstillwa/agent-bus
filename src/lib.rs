@@ -23,6 +23,7 @@ create_exception!(agent_bus_core, TopicClosedError, PyRuntimeError);
 create_exception!(agent_bus_core, TopicMismatchError, PyRuntimeError);
 create_exception!(agent_bus_core, AgentNameInUseError, PyRuntimeError);
 create_exception!(agent_bus_core, MutedError, PyRuntimeError);
+create_exception!(agent_bus_core, RateLimitedError, PyRuntimeError);
 create_exception!(agent_bus_core, PollNotFoundError, PyRuntimeError);
 create_exception!(agent_bus_core, PollClosedError, PyRuntimeError);
 create_exception!(agent_bus_core, AgentNotJoinedError, PyRuntimeError);
@@ -1494,6 +1495,52 @@ impl CoreDb {
         Ok(out.into())
     }
 
+    fn topic_reopen(&self, py: Python<'_>, topic_id: String) -> PyResult<Py<PyAny>> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction().map_err(map_db_error)?;
+        let row = tx
+            .query_row(
+                "
+                SELECT topic_id, name, status, created_at, closed_at, close_reason, metadata_json
+                FROM topics
+                WHERE topic_id = ?
+                ",
+                params![topic_id],
+                topic_row_from,
+            )
+            .optional()
+            .map_err(map_db_error)?;
+        let existing = row.ok_or_else(|| TopicNotFoundError::new_err(topic_id.clone()))?;
+        if existing.status == "open" {
+            let out = PyTuple::new(py, &[topic_to_dict(py, &existing), false.into_py_any(py)?])?;
+            return Ok(out.into());
+        }
+
+        tx.execute(
+            "
+            UPDATE topics
+            SET status = 'open', closed_at = NULL, close_reason = NULL
+            WHERE topic_id = ?
+            ",
+            params![existing.topic_id],
+        )
+        .map_err(map_db_error)?;
+        bump_topics_version(&tx).map_err(map_db_error)?;
+        tx.commit().map_err(map_db_error)?;
+
+        let updated = TopicRow {
+            topic_id: existing.topic_id,
+            name: existing.name,
+            status: "open".to_string(),
+            created_at: existing.created_at,
+            closed_at: None,
+            close_reason: None,
+            metadata_json: existing.metadata_json,
+        };
+        let out = PyTuple::new(py, &[topic_to_dict(py, &updated), true.into_py_any(py)?])?;
+        Ok(out.into())
+    }
+
     fn delete_topic(&self, topic_id: String) -> PyResult<bool> {
         let mut conn = self.connect()?;
         let tx = conn.transaction().map_err(map_db_error)?;
@@ -1922,15 +1969,13 @@ impl CoreDb {
         let mut conn = self.connect()?;
         let tx = conn.transaction().map_err(map_db_error)?;
 
-        let topic_info: Option<(String, bool)> = tx
+        let topic_info: Option<(String, bool, f64)> = tx
             .query_row(
                 "
                 SELECT
                   status,
                   CASE
                     WHEN json_valid(metadata_json) = 1
-                         AND json_extract(metadata_json, '$.chair') IS NOT NULL
-                         AND json_extract(metadata_json, '$.chair') != ?
                          AND EXISTS (
                            SELECT 1
                            FROM json_each(json_extract(metadata_json, '$.muted'))
@@ -1938,17 +1983,23 @@ impl CoreDb {
                          )
                     THEN 1
                     ELSE 0
+                  END,
+                  CASE
+                    WHEN json_valid(metadata_json) = 1
+                         AND json_type(metadata_json, '$.rate_limit') IN ('integer', 'real')
+                    THEN MAX(0.0, MIN(1.0, CAST(json_extract(metadata_json, '$.rate_limit') AS REAL)))
+                    ELSE 0.0
                   END
                 FROM topics
                 WHERE topic_id = ?
                 ",
-                params![&agent_name, &agent_name, &topic_id],
-                |r| Ok((r.get(0)?, r.get::<_, i64>(1)? != 0)),
+                params![&agent_name, &topic_id],
+                |r| Ok((r.get(0)?, r.get::<_, i64>(1)? != 0, r.get(2)?)),
             )
             .optional()
             .map_err(map_db_error)?;
 
-        let Some((status, is_muted)) = topic_info else {
+        let Some((status, is_muted, rate_limit)) = topic_info else {
             return Err(TopicNotFoundError::new_err(topic_id));
         };
         if !outbox.is_empty() {
@@ -1959,6 +2010,9 @@ impl CoreDb {
                 return Err(MutedError::new_err(format!(
                     "agent '{agent_name}' is muted in topic '{topic_id}'"
                 )));
+            }
+            if rate_limit > 0.0 {
+                check_rate_limit(&tx, &topic_id, &agent_name, rate_limit)?;
             }
         }
 
@@ -2588,6 +2642,59 @@ impl CoreDb {
         Ok(topic_to_dict(py, &updated))
     }
 
+    fn topic_set_rate_limit(
+        &self,
+        py: Python<'_>,
+        topic_id: String,
+        rate_limit: f64,
+        metadata_json: Option<String>,
+    ) -> PyResult<Py<PyAny>> {
+        if !(0.0..=1.0).contains(&rate_limit) || rate_limit.is_nan() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "rate_limit must be a number between 0.0 and 1.0",
+            ));
+        }
+
+        let mut conn = self.connect()?;
+        let tx = conn.transaction().map_err(map_db_error)?;
+        let row = tx
+            .query_row(
+                "
+                SELECT topic_id, name, status, created_at, closed_at, close_reason, metadata_json
+                FROM topics
+                WHERE topic_id = ?
+                ",
+                params![topic_id],
+                topic_row_from,
+            )
+            .optional()
+            .map_err(map_db_error)?;
+        let existing = row.ok_or_else(|| TopicNotFoundError::new_err(topic_id.clone()))?;
+
+        tx.execute(
+            "
+            UPDATE topics
+            SET metadata_json = ?
+            WHERE topic_id = ?
+            ",
+            params![metadata_json, existing.topic_id],
+        )
+        .map_err(map_db_error)?;
+        bump_topics_version(&tx).map_err(map_db_error)?;
+        tx.commit().map_err(map_db_error)?;
+
+        let updated = TopicRow {
+            topic_id: existing.topic_id,
+            name: existing.name,
+            status: existing.status,
+            created_at: existing.created_at,
+            closed_at: existing.closed_at,
+            close_reason: existing.close_reason,
+            metadata_json,
+        };
+        Ok(topic_to_dict(py, &updated))
+    }
+
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (topic_id, question, options_json, threshold="majority".to_string(), created_by="system".to_string(), poll_id=None))]
     fn poll_create(
@@ -3121,6 +3228,7 @@ fn _core(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add("TopicMismatchError", py.get_type::<TopicMismatchError>())?;
     module.add("AgentNameInUseError", py.get_type::<AgentNameInUseError>())?;
     module.add("MutedError", py.get_type::<MutedError>())?;
+    module.add("RateLimitedError", py.get_type::<RateLimitedError>())?;
     module.add("PollNotFoundError", py.get_type::<PollNotFoundError>())?;
     module.add("PollClosedError", py.get_type::<PollClosedError>())?;
     module.add("AgentNotJoinedError", py.get_type::<AgentNotJoinedError>())?;
@@ -3596,6 +3704,73 @@ impl CoreDb {
         *last_heartbeat = None;
         Ok(false)
     }
+}
+
+// Rate limiting gate: a peer may post only once enough other peers have posted since that
+// peer's own last message. `rate_limit` 0.0 disables the gate; 1.0 requires every other peer
+// to have posted first. A peer that has never posted is exempt, because requiring everyone to
+// speak before anyone may speak would deadlock the opening round.
+fn check_rate_limit(
+    tx: &rusqlite::Transaction<'_>,
+    topic_id: &str,
+    agent_name: &str,
+    rate_limit: f64,
+) -> PyResult<()> {
+    let my_last_seq: Option<i64> = tx
+        .query_row(
+            "
+            SELECT MAX(seq)
+            FROM messages
+            WHERE topic_id = ? AND sender = ?
+            ",
+            params![topic_id, agent_name],
+            |r| r.get::<_, Option<i64>>(0),
+        )
+        .map_err(map_db_error)?;
+
+    let Some(my_last_seq) = my_last_seq else {
+        return Ok(());
+    };
+
+    let other_peer_count: i64 = tx
+        .query_row(
+            "
+            SELECT COUNT(*)
+            FROM cursors
+            WHERE topic_id = ? AND agent_name != ?
+            ",
+            params![topic_id, agent_name],
+            |r| r.get(0),
+        )
+        .map_err(map_db_error)?;
+
+    if other_peer_count <= 0 {
+        return Ok(());
+    }
+
+    let posters_since: i64 = tx
+        .query_row(
+            "
+            SELECT COUNT(DISTINCT sender)
+            FROM messages
+            WHERE topic_id = ? AND sender != ? AND seq > ?
+            ",
+            params![topic_id, agent_name, my_last_seq],
+            |r| r.get(0),
+        )
+        .map_err(map_db_error)?;
+
+    let progress = posters_since as f64 / other_peer_count as f64;
+    if progress + f64::EPSILON < rate_limit {
+        let required = (rate_limit * other_peer_count as f64).ceil() as i64;
+        return Err(RateLimitedError::new_err(format!(
+            "agent '{agent_name}' is rate limited in topic '{topic_id}': \
+             {posters_since} of {other_peer_count} peers have posted since your last message; \
+             {required} required (rate_limit={rate_limit})"
+        )));
+    }
+
+    Ok(())
 }
 
 fn now() -> f64 {
