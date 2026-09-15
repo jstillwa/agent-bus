@@ -124,6 +124,21 @@ class TopicCloseOutput(ToolOutputBase):
     close_reason: str | None = None
 
 
+class TopicReopenOutput(ToolOutputBase):
+    required_on_success = ("topic_id", "status")
+
+    topic_id: str | None = None
+    status: TopicStatus | None = None
+    reopened_now: bool | None = None
+
+
+class SetRateLimitOutput(ToolOutputBase):
+    required_on_success = ("topic_id", "rate_limit")
+
+    topic_id: str | None = None
+    rate_limit: float | None = None
+
+
 class TopicResolveOutput(ToolOutputBase):
     required_on_success = ("topic_id", "name", "status")
 

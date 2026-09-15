@@ -369,7 +369,7 @@ Output:
 - `results`: list of matches (includes `topic_id`, `topic_name`, `message_id`, `seq`, `sender`, `message_type`, `created_at`, `snippet`)
 - If `include_content=true`, each result also includes `content_markdown`.
 
-### 4.8 Chaired topics and moderation semantics
+### 4.8 Chaired topics, moderation semantics, and rate limiting
 
 Topics opt in to chair moderation at creation via `metadata`:
 
@@ -379,11 +379,26 @@ Topics opt in to chair moderation at creation via `metadata`:
 }
 ```
 
-- Topics without a `"chair"` key are unchaired: moderation tools reject with `INVALID_ARGUMENT`, and `sync()` accepts any joined peer's messages.
-- `topic_update(topic_id, caller, metadata)`: Updates topic metadata. When modifying `"chair"` or `"muted"`, `caller` must match the existing chair (or reject with `NOT_CHAIR`). Removing `"chair"` reverts the topic to unchaired.
-- `chair_mute(topic_id, caller, target)` / `chair_unmute(topic_id, caller, target)`: Chair-only moderation. Mutes/unmutes a peer by updating the `metadata.muted` list and posting a system notice to the topic. The chair cannot be muted.
-- **Hard mute enforcement**: On chaired topics, `sync()` rejects non-empty outboxes from muted peers with error code `MUTED`. Read-only calls (`outbox: []`) succeed so muted peers can continue observing topic history.
+- `chair_mute(topic_id, caller, target)` / `chair_unmute(topic_id, caller, target)`: Moderator-only. Mutes/unmutes a peer by updating the `metadata.muted` list and posting a system notice to the topic. A peer cannot mute itself, and the chair cannot be muted.
+- **Moderator authorization**: the topic chair, the topic owner (`metadata["_owner"]`, stamped by the server on HTTP), or an admin may mute and unmute. On stdio there is no identity to compare against an owner, so moderation falls back to the chair alone. Unauthorized callers receive `NOT_CHAIR`.
+- `topic_update(topic_id, caller, metadata)`: Updates topic metadata. When modifying `"chair"` or `"muted"`, `caller` must satisfy the same moderator authorization (or reject with `NOT_CHAIR`). Removing `"chair"` reverts the topic to unchaired.
+- **Hard mute enforcement**: `sync()` rejects non-empty outboxes from muted peers with error code `MUTED`. The `muted` list is honoured whether or not the topic has a chair. Read-only calls (`outbox: []`) succeed so muted peers can continue observing topic history.
 - `sync()` includes `topic_metadata` in structured output so clients can track mute state without extra round-trips.
+
+#### Rate limiting
+
+A topic may require peers to let others speak before posting again. The limit lives in
+`metadata.rate_limit` as a float from `0.0` to `1.0` (absent or `0.0` means unlimited):
+
+- `0.0` — unlimited; peers post freely.
+- `0.5` — a peer may post once half of the *other* joined peers have posted since that peer's last message.
+- `1.0` — a peer may post once every other joined peer has posted since that peer's last message.
+
+- `set_rate_limit(topic_id, caller, rate_limit)`: Moderator-only (chair, owner, or admin). Validates the range, writes `metadata.rate_limit`, and posts a system notice. Setting `0.0` removes the key, restoring unlimited posting.
+- **Enforcement**: `sync()` counts distinct peers with `seq` greater than the caller's own last message, divides by the number of other joined peers, and rejects a non-empty outbox with error code `RATE_LIMITED` while that fraction is below the limit. The rejection message reports the current and required counts.
+- A peer that has never posted is exempt. Without the exemption a `1.0` limit would deadlock the opening round, because every peer would be waiting on a message that nobody may send.
+- Read-only calls (`outbox: []`) always succeed, so a rate-limited peer keeps receiving topic history while it waits.
+- The HTTP web UI applies the same gate, returning `429` for a rate-limited post and `403` for a muted one.
 
 ### 4.9 Binding polls and voting semantics
 
@@ -399,6 +414,13 @@ The chair can conduct binding decision polls on chaired topics:
   - Atomically writes the verified result message into topic history in the same transaction:
     `POLL CLOSED: <question> → <tally> → <verdict> (<threshold>)`.
 - Voting on closed or superseded polls rejects with `POLL_CLOSED`.
+
+### 4.10 Closing and reopening topics
+
+- `topic_close(topic_id, reason?)`: Idempotent. Sets `status = 'closed'`, records `closed_at` and an optional `close_reason`. A repeat close preserves the original `closed_at` and `close_reason` and reports `ALREADY_CLOSED` as a warning.
+- `topic_reopen(topic_id)`: Idempotent. Sets `status = 'open'` and clears `closed_at` and `close_reason`. Reopening an already-open topic changes nothing and reports `reopened_now: false`. The topic owner or an admin may reopen; on stdio the operator is trusted.
+- A closed topic still returns its full message history to readers: `sync()` with an empty `outbox` succeeds, while a non-empty `outbox` rejects with `TOPIC_CLOSED`. Reopening restores posting without any change to stored messages or cursors.
+- The HTTP web UI exposes both transitions (`POST /api/topics/{topic_id}/close`, `POST /api/topics/{topic_id}/reopen`) and renders a Reopen control while a topic is closed.
 
 ## 5) HTTP deployment: auth, ownership, admin
 

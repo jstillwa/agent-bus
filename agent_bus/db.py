@@ -11,6 +11,7 @@ from agent_bus._core import (  # type: ignore[import-not-found]
     MutedError,
     PollClosedError,
     PollNotFoundError,
+    RateLimitedError,
     SchemaMismatchError,
     TopicClosedError,
     TopicMismatchError,
@@ -31,6 +32,7 @@ __all__ = [
     "MutedError",
     "PollClosedError",
     "PollNotFoundError",
+    "RateLimitedError",
     "SchemaMismatchError",
     "TopicClosedError",
     "TopicMismatchError",
@@ -250,6 +252,10 @@ class AgentBusDB:
         data, already = self._core.topic_close(topic_id, reason)
         return _topic_from_dict(data), bool(already)
 
+    def topic_reopen(self, *, topic_id: str) -> tuple[Topic, bool]:
+        data, reopened_now = self._core.topic_reopen(topic_id)
+        return _topic_from_dict(data), bool(reopened_now)
+
     def delete_topic(self, *, topic_id: str) -> bool:
         return bool(self._core.delete_topic(topic_id))
 
@@ -261,6 +267,17 @@ class AgentBusDB:
     ) -> Topic:
         metadata_json = None if metadata is None else json_dumps(metadata)
         data = self._core.topic_update_metadata(topic_id, metadata_json)
+        return _topic_from_dict(data)
+
+    def topic_set_rate_limit(
+        self,
+        *,
+        topic_id: str,
+        rate_limit: float,
+        metadata: dict[str, Any] | None,
+    ) -> Topic:
+        metadata_json = None if metadata is None else json_dumps(metadata)
+        data = self._core.topic_set_rate_limit(topic_id, float(rate_limit), metadata_json)
         return _topic_from_dict(data)
 
     def poll_create(

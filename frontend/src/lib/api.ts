@@ -3,6 +3,7 @@ import type {
   CloseTopicResponse,
   PostMessagePayload,
   PostMessageResponse,
+  ReopenTopicResponse,
   SearchMode,
   SearchResponse,
   TopicDetailResponse,
@@ -147,6 +148,12 @@ export async function closeTopicAction(
       "Content-Type": "application/json",
     },
     body: JSON.stringify(payload ?? {}),
+  })
+}
+
+export async function reopenTopicAction(topicId: string): Promise<ReopenTopicResponse> {
+  return fetchJson<ReopenTopicResponse>(`/topics/${topicId}/reopen`, {
+    method: "POST",
   })
 }
 

@@ -25,7 +25,7 @@ from pydantic import BaseModel, Field
 from starlette.routing import Route
 
 from agent_bus.auth import AuthIdentity, TokenAuthMiddleware, identity_from_scope
-from agent_bus.db import AgentBusDB, DBBusyError, TopicNotFoundError
+from agent_bus.db import AgentBusDB, DBBusyError, MutedError, RateLimitedError, TopicNotFoundError
 from agent_bus.models import Cursor, Message
 from agent_bus.ownership import OWNER_KEY, is_visible, owner_key
 
@@ -812,6 +812,10 @@ async def api_post_message(
         )
     except DBBusyError:
         raise HTTPException(status_code=503, detail="Database is busy") from None
+    except MutedError as e:
+        raise HTTPException(status_code=403, detail=str(e)) from None
+    except RateLimitedError as e:
+        raise HTTPException(status_code=429, detail=str(e)) from None
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from None
 
@@ -852,6 +856,25 @@ async def api_close_topic(
         "status": "ok",
         "topic": summary,
         "closed_now": closed_now,
+    }
+
+
+@app.post("/api/topics/{topic_id}/reopen")
+async def api_reopen_topic(request: Request, topic_id: str) -> dict[str, Any]:
+    db = get_db()
+    guard_topic(request, topic_id)
+    try:
+        _topic, reopened_now = await asyncio.to_thread(db.topic_reopen, topic_id=topic_id)
+    except TopicNotFoundError:
+        raise HTTPException(status_code=404, detail="Topic not found") from None
+    except DBBusyError:
+        raise HTTPException(status_code=503, detail="Database is busy") from None
+
+    summary = get_topic_summary(db, topic_id=topic_id)
+    return {
+        "status": "ok",
+        "topic": summary,
+        "reopened_now": reopened_now,
     }
 
 

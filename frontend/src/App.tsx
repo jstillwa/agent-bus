@@ -10,17 +10,20 @@ import {
   ArrowUpDownIcon,
   CheckCircle2Icon,
   CheckIcon,
+  ChevronDownIcon,
   FolderSearch2Icon,
   ListFilterIcon,
   LogOutIcon,
   MessageSquareMoreIcon,
+  RotateCcwIcon,
   SendIcon,
   Trash2Icon,
+  VolumeXIcon,
   XIcon,
 } from "lucide-react"
 
 import { fetchSearchResults, fetchTopicDetail, fetchTopicMessages, fetchTopics } from "@/lib/api"
-import { closeTopicAction, deleteMessages, deleteTopic, exportTopicUrl, postTopicMessage } from "@/lib/api"
+import { closeTopicAction, deleteMessages, deleteTopic, exportTopicUrl, postTopicMessage, reopenTopicAction } from "@/lib/api"
 import { formatAbsoluteTime, formatRelativeTime, initialsFor } from "@/lib/format"
 import type {
   CursorPresence,
@@ -52,6 +55,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
 import { ScrollArea } from "@/components/ui/scroll-area"
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible"
 import { Separator } from "@/components/ui/separator"
 import { Textarea } from "@/components/ui/textarea"
 import {
@@ -621,50 +625,127 @@ function MessageCard(props: {
   )
 }
 
-function TopicInspectorPanel(props: { topicDetail: TopicDetailResponse }) {
-  const { topicDetail } = props
+function TopicInspectorPanel(props: {
+  topicDetail: TopicDetailResponse
+  onReopenTopic: () => void
+}) {
+  const { topicDetail, onReopenTopic } = props
+  const metadata = topicDetail.topic.metadata ?? {}
+  const chair = typeof metadata.chair === "string" ? metadata.chair : null
+  const muted = Array.isArray(metadata.muted)
+    ? (metadata.muted as unknown[]).filter((m): m is string => typeof m === "string")
+    : []
+  const rateLimit =
+    typeof metadata.rate_limit === "number" && Number.isFinite(metadata.rate_limit)
+      ? (metadata.rate_limit as number)
+      : 0
 
   return (
-    <div className="flex flex-1 flex-col gap-4 p-4 text-sm">
-      <div className="grid grid-cols-2 gap-2">
-        <div className="border border-border bg-background px-3 py-3">
-          <div className="text-[10px] uppercase tracking-[0.12em] text-muted-foreground">Status</div>
-          <div className="mt-2 font-medium">{topicDetail.topic.status}</div>
-        </div>
-        <div className="border border-border bg-background px-3 py-3">
-          <div className="text-[10px] uppercase tracking-[0.12em] text-muted-foreground">Messages</div>
-          <div className="mt-2 font-medium">{topicDetail.message_count}</div>
-        </div>
-        <div className="border border-border bg-background px-3 py-3">
-          <div className="text-[10px] uppercase tracking-[0.12em] text-muted-foreground">Last seq</div>
-          <div className="mt-2 font-medium">{topicDetail.last_seq ?? 0}</div>
-        </div>
-        <div className="border border-border bg-background px-3 py-3">
-          <div className="text-[10px] uppercase tracking-[0.12em] text-muted-foreground">Updated</div>
-          <div className="mt-2 font-medium">{formatRelativeTime(topicDetail.topic.last_updated_at)}</div>
-        </div>
-      </div>
-      <div className="border border-border bg-background px-3 py-3">
-        <div className="text-[10px] uppercase tracking-[0.12em] text-muted-foreground">Created</div>
-        <div className="mt-2 font-medium">{formatAbsoluteTime(topicDetail.topic.created_at)}</div>
-      </div>
-      <Separator />
-      <div className="flex flex-col gap-3">
-        <div className="font-medium">Presence</div>
-        {topicDetail.presence.length === 0 ? (
-          <p className="text-muted-foreground">No peers have touched this topic recently.</p>
-        ) : (
-          topicDetail.presence.map((presence: CursorPresence) => (
-            <div key={presence.agent_name} className="border border-border bg-background px-3 py-3">
-              <div className="font-medium">{presence.agent_name}</div>
-              <div className="text-xs text-muted-foreground">
-                last seq {presence.last_seq} · {formatRelativeTime(presence.updated_at)}
-              </div>
+    <ScrollArea className="min-h-0 flex-1" data-ab-inspector-scroll-area="true">
+      <div className="flex flex-col gap-4 p-4 text-sm">
+        <div className="grid grid-cols-2 gap-2">
+          <div className="border border-border bg-background px-3 py-3">
+            <div className="text-[10px] uppercase tracking-[0.12em] text-muted-foreground">Status</div>
+            <div className="mt-2 font-medium">{topicDetail.topic.status}</div>
+          </div>
+          <div className="border border-border bg-background px-3 py-3">
+            <div className="text-[10px] uppercase tracking-[0.12em] text-muted-foreground">Messages</div>
+            <div className="mt-2 font-medium">{topicDetail.message_count}</div>
+          </div>
+          <div className="border border-border bg-background px-3 py-3">
+            <div className="text-[10px] uppercase tracking-[0.12em] text-muted-foreground">Last seq</div>
+            <div className="mt-2 font-medium">{topicDetail.last_seq ?? 0}</div>
+          </div>
+          <div className="border border-border bg-background px-3 py-3">
+            <div className="text-[10px] uppercase tracking-[0.12em] text-muted-foreground">Updated</div>
+            <div className="mt-2 font-medium">
+              {formatRelativeTime(topicDetail.topic.last_updated_at)}
             </div>
-          ))
-        )}
+          </div>
+        </div>
+        <div className="border border-border bg-background px-3 py-3">
+          <div className="text-[10px] uppercase tracking-[0.12em] text-muted-foreground">Created</div>
+          <div className="mt-2 font-medium">{formatAbsoluteTime(topicDetail.topic.created_at)}</div>
+        </div>
+
+        {topicDetail.topic.status === "closed" ? (
+          <div className="flex flex-col gap-2 border border-border bg-background px-3 py-3">
+            <div className="text-[10px] uppercase tracking-[0.12em] text-muted-foreground">
+              Closed
+            </div>
+            {topicDetail.topic.close_reason ? (
+              <div className="text-xs text-muted-foreground">{topicDetail.topic.close_reason}</div>
+            ) : null}
+            <Button variant="outline" size="sm" onClick={onReopenTopic}>
+              <RotateCcwIcon data-icon="inline-start" />
+              Reopen topic
+            </Button>
+          </div>
+        ) : null}
+
+        <Separator />
+
+        <div className="flex flex-col gap-2 border border-border bg-background px-3 py-3">
+          <div className="text-[10px] uppercase tracking-[0.12em] text-muted-foreground">
+            Moderation
+          </div>
+          <div className="flex flex-col gap-1 text-xs">
+            <div>
+              Chair: <span className="font-medium">{chair ?? "none"}</span>
+            </div>
+            <div>
+              Rate limit:{" "}
+              <span className="font-medium">
+                {rateLimit > 0 ? `${rateLimit} of peers must post first` : "unlimited"}
+              </span>
+            </div>
+          </div>
+          <div className="flex flex-col gap-1">
+            <div className="text-[10px] uppercase tracking-[0.12em] text-muted-foreground">
+              Muted ({muted.length})
+            </div>
+            {muted.length === 0 ? (
+              <div className="text-xs text-muted-foreground">No muted peers.</div>
+            ) : (
+              <div className="flex flex-wrap gap-1">
+                {muted.map((name) => (
+                  <Badge key={name} variant="outline" className="gap-1">
+                    <VolumeXIcon className="size-3" />
+                    {name}
+                  </Badge>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+
+        <Separator />
+
+        <Collapsible defaultOpen className="flex flex-col gap-3">
+          <CollapsibleTrigger className="group flex w-full items-center justify-between gap-2 text-left">
+            <span className="font-medium">Presence</span>
+            <span className="flex items-center gap-2 text-xs text-muted-foreground">
+              {topicDetail.presence.length}
+              <ChevronDownIcon className="size-4 transition-transform group-data-[state=closed]:-rotate-90" />
+            </span>
+          </CollapsibleTrigger>
+          <CollapsibleContent className="flex flex-col gap-3">
+            {topicDetail.presence.length === 0 ? (
+              <p className="text-muted-foreground">No peers have touched this topic recently.</p>
+            ) : (
+              topicDetail.presence.map((presence: CursorPresence) => (
+                <div key={presence.agent_name} className="border border-border bg-background px-3 py-3">
+                  <div className="font-medium">{presence.agent_name}</div>
+                  <div className="text-xs text-muted-foreground">
+                    last seq {presence.last_seq} · {formatRelativeTime(presence.updated_at)}
+                  </div>
+                </div>
+              ))
+            )}
+          </CollapsibleContent>
+        </Collapsible>
       </div>
-    </div>
+    </ScrollArea>
   )
 }
 
@@ -925,6 +1006,7 @@ function TopicView(props: {
   onLoadEarlier: () => void
   onDeleteTopic: () => void
   onCloseTopic: () => void
+  onReopenTopic: () => void
   onSendMessage: (content: string, sender: string, messageType: string) => Promise<void>
 }) {
   const {
@@ -946,6 +1028,7 @@ function TopicView(props: {
     onLoadEarlier,
     onDeleteTopic,
     onCloseTopic,
+    onReopenTopic,
     onSendMessage,
   } = props
 
@@ -1274,16 +1357,12 @@ function TopicView(props: {
               </Button>
             </div>
           </div>
-          <div className="flex flex-wrap items-center gap-2 text-sm">
-            {topicDetail.presence.length === 0 ? (
-              <span className="text-muted-foreground">No active peers</span>
-            ) : (
-              topicDetail.presence.map((presence) => (
-                <Badge key={presence.agent_name} variant="secondary">
-                  {presence.agent_name}
-                </Badge>
-              ))
-            )}
+          <div className="flex flex-wrap items-center gap-2 text-sm xl:hidden">
+            <span className="text-muted-foreground">
+              {topicDetail.presence.length === 0
+                ? "No active peers"
+                : `${topicDetail.presence.length} active peer${topicDetail.presence.length === 1 ? "" : "s"}`}
+            </span>
           </div>
         </CardHeader>
         <CardContent className="flex min-h-0 flex-1 flex-col gap-0 p-0">
@@ -1433,7 +1512,7 @@ function TopicView(props: {
                 </div>
               </ScrollArea>
               {topicDetail.topic.status === "open" ? (
-                <div className="border-t border-border bg-[#1d2026] p-3 shrink-0">
+                <div className="relative z-20 shrink-0 border-t border-border bg-[#1d2026] p-3">
                   <div className="flex flex-col gap-2">
                     <div className="flex items-center justify-between gap-2">
                       <div className="flex items-center gap-2">
@@ -1474,7 +1553,7 @@ function TopicView(props: {
                           }
                         }}
                         placeholder="Type a message into this topic thread..."
-                        className="min-h-[60px] max-h-48 resize-y border-zinc-700 bg-[#111318] text-sm text-zinc-100 placeholder:text-zinc-500 focus-visible:border-sky-500 focus-visible:ring-sky-500/25"
+                        className="min-h-[60px] max-h-32 resize-none border-zinc-700 bg-[#111318] text-sm text-zinc-100 placeholder:text-zinc-500 focus-visible:border-sky-500 focus-visible:ring-sky-500/25"
                       />
                       <Button
                         size="sm"
@@ -1489,8 +1568,15 @@ function TopicView(props: {
                   </div>
                 </div>
               ) : (
-                <div className="border-t border-border bg-muted/20 px-4 py-2.5 text-center text-xs text-muted-foreground shrink-0">
-                  This topic is closed{topicDetail.topic.close_reason ? ` (${topicDetail.topic.close_reason})` : ""}.
+                <div className="flex shrink-0 flex-wrap items-center justify-center gap-3 border-t border-border bg-muted/20 px-4 py-2.5 text-center text-xs text-muted-foreground">
+                  <span>
+                    This topic is closed
+                    {topicDetail.topic.close_reason ? ` (${topicDetail.topic.close_reason})` : ""}.
+                  </span>
+                  <Button variant="outline" size="sm" onClick={onReopenTopic}>
+                    <RotateCcwIcon data-icon="inline-start" />
+                    Reopen topic
+                  </Button>
                 </div>
               )}
             </div>
@@ -1503,7 +1589,7 @@ function TopicView(props: {
             <div className="text-[10px] uppercase tracking-[0.22em] text-muted-foreground">Inspector</div>
             <CardTitle className="text-base">Topic metadata</CardTitle>
           </CardHeader>
-          <TopicInspectorPanel topicDetail={topicDetail} />
+          <TopicInspectorPanel topicDetail={topicDetail} onReopenTopic={onReopenTopic} />
         </>
       </aside>
     </div>
@@ -2396,6 +2482,32 @@ export default function App() {
     }
   }
 
+  async function handleReopenTopic() {
+    if (!topicDetail || topicDetail.topic.status !== "closed") {
+      return
+    }
+
+    try {
+      const res = await reopenTopicAction(topicDetail.topic.topic_id)
+      toast.success(`Reopened topic "${topicDetail.topic.name}"`)
+      setTopicDetail((current) => {
+        if (!current) return current
+        return {
+          ...current,
+          topic: res.topic,
+        }
+      })
+      const nextTopics = await fetchTopics({
+        status: workbenchState.sidebarStatus,
+        sort: workbenchState.sidebarSort,
+        query: "",
+      })
+      setTopics(nextTopics)
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "Failed to reopen topic")
+    }
+  }
+
   async function handleSendMessage(contentMarkdown: string, sender: string, messageType: string) {
     if (!topicDetail || !contentMarkdown.trim()) {
       return
@@ -2612,6 +2724,7 @@ export default function App() {
                     onLoadEarlier={() => void loadEarlierMessages()}
                     onDeleteTopic={() => void handleDeleteTopic()}
                     onCloseTopic={() => void handleCloseTopic()}
+                    onReopenTopic={() => void handleReopenTopic()}
                     onSendMessage={(content, sender, type) => handleSendMessage(content, sender, type)}
                   />
                 ) : (

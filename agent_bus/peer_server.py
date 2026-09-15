@@ -30,6 +30,7 @@ from agent_bus.db import (
     MutedError,
     PollClosedError,
     PollNotFoundError,
+    RateLimitedError,
     SchemaMismatchError,
     TopicClosedError,
     TopicNotFoundError,
@@ -53,12 +54,14 @@ from agent_bus.tool_schemas import (
     PollOpenOutput,
     PollStatusOutput,
     PollVoteOutput,
+    SetRateLimitOutput,
     SyncOutput,
     TopicCloseOutput,
     TopicCreateOutput,
     TopicJoinOutput,
     TopicListOutput,
     TopicPresenceOutput,
+    TopicReopenOutput,
     TopicResolveOutput,
     TopicUpdateOutput,
 )
@@ -269,6 +272,39 @@ def topic_create(
     )
 
 
+def _is_moderator(
+    metadata: dict[str, Any],
+    caller: str,
+    chair: str | None,
+    auth: AuthIdentity | None,
+    *,
+    trust_stdio: bool = False,
+) -> bool:
+    """True when the caller may moderate this topic.
+
+    Moderation is granted to the topic's chair, to the topic's owner, or to an
+    admin. The chair check keeps chaired sessions (for example the Design Review
+    Court, where the chair is a peer name rather than the authenticated owner)
+    working. The owner check lets a creator moderate topics they own without
+    having to appoint themselves chair, and applies on HTTP where the server
+    stamps `metadata["_owner"]`. Admins may moderate anything.
+
+    On stdio there is no identity to compare against an owner. `trust_stdio`
+    controls whether the local operator is treated as trusted there: local-file
+    trust means the operator already owns the database, so the newer rate-limit
+    tool opts in. Mute keeps the stricter chair-only rule on stdio so the
+    published chaired-topic contract is unchanged.
+    """
+    if chair and caller == chair:
+        return True
+    if auth is None:
+        return trust_stdio
+    if auth.admin:
+        return True
+    owner = metadata.get(OWNER_KEY)
+    return bool(owner) and owner == owner_key(auth)
+
+
 @mcp.tool(description="List topics in the shared Agent Bus DB.")
 def topic_list(
     status: Literal["open", "closed", "all"] = "open",
@@ -465,6 +501,124 @@ def topic_close(
             "close_reason": topic.close_reason,
         },
         warnings=warnings or None,
+    )
+
+
+@mcp.tool(
+    description=(
+        "Reopen a closed topic (topic owner or admin). Clears the close reason and resumes posting."
+    )
+)
+def topic_reopen(
+    topic_id: str,
+) -> Annotated[CallToolResult, TopicReopenOutput]:
+    """Reopen a closed topic (topic owner or admin)."""
+    err = _topic_access_error(topic_id)
+    if err is not None:
+        return err
+
+    try:
+        db.topic_reopen(topic_id=topic_id)
+    except SchemaMismatchError as e:
+        return _schema_mismatch_result(e)
+    except TopicNotFoundError:
+        return tool_error(code=ErrorCode.TOPIC_NOT_FOUND, message="Topic not found.")
+    except DBBusyError:
+        return tool_error(code=ErrorCode.DB_BUSY, message="Database is busy.")
+
+    return tool_ok(
+        text=f'Topic reopened: topic_id="{topic_id}"',
+        structured={
+            "topic_id": topic_id,
+            "status": "open",
+            "reopened_now": True,
+        },
+    )
+
+
+@mcp.tool(
+    description=(
+        "Set a topic's rate limit (0.0-1.0). 0 disables it; the value is the fraction of "
+        "other peers that must post before a peer may post again. Requires being the "
+        "topic's chair or owner, or an admin."
+    )
+)
+def set_rate_limit(
+    topic_id: str,
+    caller: Annotated[str, Field(description="Your agent name.")],
+    rate_limit: Annotated[
+        float, Field(description="Fraction of other peers required to post first (0.0-1.0).")
+    ],
+) -> Annotated[CallToolResult, SetRateLimitOutput]:
+    """Set a topic's rate limit (chair, owner, or admin)."""
+    err = _topic_access_error(topic_id)
+    if err is not None:
+        return err
+
+    try:
+        topic = db.get_topic(topic_id=topic_id)
+    except TopicNotFoundError:
+        return tool_error(code=ErrorCode.TOPIC_NOT_FOUND, message="Topic not found.")
+    except DBBusyError:
+        return tool_error(code=ErrorCode.DB_BUSY, message="Database is busy.")
+
+    if not isinstance(rate_limit, (int, float)) or isinstance(rate_limit, bool):
+        return tool_error(code=ErrorCode.INVALID_ARGUMENT, message="rate_limit must be a number.")
+    value = float(rate_limit)
+    if not (0.0 <= value <= 1.0):
+        return tool_error(
+            code=ErrorCode.INVALID_ARGUMENT,
+            message="rate_limit must be between 0.0 and 1.0.",
+        )
+
+    existing_meta = dict(topic.metadata or {})
+    chair = existing_meta.get("chair")
+    auth = _current_auth()
+    caller_name = caller.strip()
+    if not _is_moderator(existing_meta, caller_name, chair, auth, trust_stdio=True):
+        return tool_error(
+            code=ErrorCode.NOT_CHAIR,
+            message=(
+                "Only the topic chair, its owner, or an admin may set the rate limit "
+                f"(chair: {chair or 'none'})."
+            ),
+        )
+
+    if value <= 0.0:
+        existing_meta.pop("rate_limit", None)
+    else:
+        existing_meta["rate_limit"] = value
+
+    try:
+        db.topic_set_rate_limit(topic_id=topic_id, rate_limit=value, metadata=existing_meta or None)
+    except SchemaMismatchError as e:
+        return _schema_mismatch_result(e)
+    except TopicNotFoundError:
+        return tool_error(code=ErrorCode.TOPIC_NOT_FOUND, message="Topic not found.")
+    except DBBusyError:
+        return tool_error(code=ErrorCode.DB_BUSY, message="Database is busy.")
+    except ValueError as e:
+        return tool_error(code=ErrorCode.INVALID_ARGUMENT, message=str(e))
+
+    notice = (
+        f"SYSTEM: rate limit for this topic set to {value} by {caller_name}."
+        if value > 0.0
+        else f"SYSTEM: rate limit for this topic disabled by {caller_name}."
+    )
+    with contextlib.suppress(Exception):
+        db.sync_once(
+            topic_id=topic_id,
+            agent_name=caller_name,
+            outbox=[{"content_markdown": notice, "message_type": "system"}],
+            max_items=0,
+            include_self=False,
+            auto_advance=False,
+            ack_through=None,
+        )
+
+    return tool_ok(
+        text=notice,
+        structured={"topic_id": topic_id, "rate_limit": value},
     )
 
 
@@ -987,6 +1141,8 @@ async def sync(
         return tool_error(code=ErrorCode.TOPIC_CLOSED, message="Topic is closed.")
     except MutedError as e:
         return tool_error(code=ErrorCode.MUTED, message=str(e))
+    except RateLimitedError as e:
+        return tool_error(code=ErrorCode.RATE_LIMITED, message=str(e))
     except DBBusyError:
         return tool_error(code=ErrorCode.DB_BUSY, message="Database is busy.")
     except ValueError as e:
@@ -1165,15 +1321,17 @@ def topic_update(
 
 @mcp.tool(
     description=(
-        "Mute a peer on a chaired topic (chair only). Muted peers cannot post messages to the topic."
+        "Mute a peer on a topic (chair, owner, or admin). Muted peers cannot post messages to the topic."
     )
 )
 def chair_mute(
     topic_id: str,
-    caller: Annotated[str, Field(description="Your agent name (must be the topic chair).")],
+    caller: Annotated[
+        str, Field(description="Your agent name (must be the topic chair, its owner, or an admin).")
+    ],
     target: Annotated[str, Field(description="Agent name to mute.")],
 ) -> Annotated[CallToolResult, ChairMuteOutput]:
-    """Mute a peer on a chaired topic (chair only)."""
+    """Mute a peer on a topic (chair, owner, or admin)."""
     err = _topic_access_error(topic_id)
     if err:
         return err
@@ -1188,11 +1346,14 @@ def chair_mute(
 
     meta = dict(topic.metadata or {})
     chair = meta.get("chair")
-    if not chair:
-        return tool_error(code=ErrorCode.INVALID_ARGUMENT, message="Topic is not chaired.")
-    if caller.strip() != chair:
+    caller_name = caller.strip()
+    if not _is_moderator(meta, caller_name, chair, _current_auth()):
         return tool_error(
-            code=ErrorCode.NOT_CHAIR, message=f"Only the chair ({chair}) may mute peers."
+            code=ErrorCode.NOT_CHAIR,
+            message=(
+                "Only the topic chair, its owner, or an admin may mute peers "
+                f"(chair: {chair or 'none'})."
+            ),
         )
 
     target_name = target.strip()
@@ -1200,8 +1361,10 @@ def chair_mute(
         return tool_error(
             code=ErrorCode.INVALID_ARGUMENT, message="target must be a non-empty string."
         )
-    if target_name == chair:
+    if chair and target_name == chair:
         return tool_error(code=ErrorCode.INVALID_ARGUMENT, message="The chair cannot be muted.")
+    if target_name == caller_name:
+        return tool_error(code=ErrorCode.INVALID_ARGUMENT, message="You cannot mute yourself.")
 
     muted = list(meta.get("muted") or [])
     if target_name not in muted:
@@ -1213,7 +1376,7 @@ def chair_mute(
     except DBBusyError:
         return tool_error(code=ErrorCode.DB_BUSY, message="Database is busy.")
 
-    notice = f"SYSTEM: {target_name} has been muted by chair {caller.strip()}."
+    notice = f"SYSTEM: {target_name} has been muted by {caller_name}."
     with contextlib.suppress(Exception):
         db.sync_once(
             topic_id=topic_id,
@@ -1233,15 +1396,17 @@ def chair_mute(
 
 @mcp.tool(
     description=(
-        "Unmute a peer on a chaired topic (chair only). Restores posting ability for the peer."
+        "Unmute a peer on a topic (chair, owner, or admin). Restores posting ability for the peer."
     )
 )
 def chair_unmute(
     topic_id: str,
-    caller: Annotated[str, Field(description="Your agent name (must be the topic chair).")],
+    caller: Annotated[
+        str, Field(description="Your agent name (must be the topic chair, its owner, or an admin).")
+    ],
     target: Annotated[str, Field(description="Agent name to unmute.")],
 ) -> Annotated[CallToolResult, ChairUnmuteOutput]:
-    """Unmute a peer on a chaired topic (chair only)."""
+    """Unmute a peer on a topic (chair, owner, or admin)."""
     err = _topic_access_error(topic_id)
     if err:
         return err
@@ -1256,11 +1421,14 @@ def chair_unmute(
 
     meta = dict(topic.metadata or {})
     chair = meta.get("chair")
-    if not chair:
-        return tool_error(code=ErrorCode.INVALID_ARGUMENT, message="Topic is not chaired.")
-    if caller.strip() != chair:
+    caller_name = caller.strip()
+    if not _is_moderator(meta, caller_name, chair, _current_auth()):
         return tool_error(
-            code=ErrorCode.NOT_CHAIR, message=f"Only the chair ({chair}) may unmute peers."
+            code=ErrorCode.NOT_CHAIR,
+            message=(
+                "Only the topic chair, its owner, or an admin may unmute peers "
+                f"(chair: {chair or 'none'})."
+            ),
         )
 
     target_name = target.strip()
@@ -1277,7 +1445,7 @@ def chair_unmute(
     except DBBusyError:
         return tool_error(code=ErrorCode.DB_BUSY, message="Database is busy.")
 
-    notice = f"SYSTEM: {target_name} has been unmuted by chair {caller.strip()}."
+    notice = f"SYSTEM: {target_name} has been unmuted by {caller_name}."
     with contextlib.suppress(Exception):
         db.sync_once(
             topic_id=topic_id,
@@ -1303,7 +1471,9 @@ def chair_unmute(
 )
 def poll_open(
     topic_id: str,
-    caller: Annotated[str, Field(description="Your agent name (must be the topic chair).")],
+    caller: Annotated[
+        str, Field(description="Your agent name (must be the topic chair, its owner, or an admin).")
+    ],
     question: Annotated[str, Field(description="The poll question to decide.")],
     options: Annotated[
         list[str] | None,
@@ -1457,7 +1627,9 @@ def poll_vote(
 )
 def poll_close(
     poll_id: str,
-    caller: Annotated[str, Field(description="Your agent name (must be the topic chair).")],
+    caller: Annotated[
+        str, Field(description="Your agent name (must be the topic chair, its owner, or an admin).")
+    ],
 ) -> Annotated[CallToolResult, PollCloseOutput]:
     """Close an open poll (chair only)."""
     poll_data = db.poll_get(poll_id=poll_id)

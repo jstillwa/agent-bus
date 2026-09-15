@@ -34,3 +34,35 @@ test("reveals the thread-map overlay for long desktop topics while keeping the i
   await expect(page.locator("[data-ab-thread-map='true']")).toBeVisible()
   await expect(page.locator("[data-ab-thread-map-marker]").first()).toBeVisible()
 })
+
+test("keeps the send button clickable with a tall draft and the inspector scrollable", async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 480 })
+  await page.goto("/")
+
+  await page.getByRole("button", { name: /Alpha review/i }).click()
+
+  // The inspector renders its own scroll area rather than overflowing its rail.
+  await expect(page.locator("[data-ab-inspector-scroll-area='true']")).toBeVisible()
+
+  // Grow the draft so the composer is at its tallest, then confirm the send button is
+  // genuinely clickable. The thread-map hotspot overlays the right edge at z-10 and
+  // intercepts pointer events over the composer unless the composer outranks it, so a
+  // hit-tested click is the assertion that catches the regression.
+  await page.getByPlaceholder("Type a message into this topic thread...").fill("line\n".repeat(30))
+
+  const sendButton = page.getByRole("button", { name: "Send" })
+  await expect(sendButton).toBeVisible()
+  await sendButton.click({ trial: true })
+
+  const box = await sendButton.boundingBox()
+  expect(box).not.toBeNull()
+  expect(box!.y + box!.height).toBeLessThanOrEqual(480)
+
+  // The thread keeps a non-zero viewport that scrolls, rather than collapsing away.
+  const threadScrolls = await page.evaluate(() => {
+    const root = document.querySelector("[data-ab-topic-thread-scroll-area='true']") as HTMLElement
+    const viewport = root.querySelector("[data-slot='scroll-area-viewport']") as HTMLElement
+    return viewport.clientHeight > 0 && viewport.scrollHeight > viewport.clientHeight
+  })
+  expect(threadScrolls).toBe(true)
+})
